@@ -14,6 +14,47 @@ import { options } from '../options';
 const DB_NAME = packageJson.name;
 const DB_VERSION = 2;
 
+const BOOKMARK_CONTEXT_FIELDS = [
+  '__bookmark_folder_id',
+  '__bookmark_folder_name',
+  '__bookmark_folder_name_source',
+  '__bookmark_folder_url',
+] as const;
+
+function mergeTweetMetadata(existing: unknown, incoming: Tweet): Tweet {
+  if (!existing || typeof existing !== 'object') {
+    return incoming;
+  }
+
+  const merged = { ...incoming } as unknown as Record<string, unknown>;
+  const existingObj = existing as unknown as Record<string, unknown>;
+
+  for (const field of BOOKMARK_CONTEXT_FIELDS) {
+    const existingValue = existingObj[field];
+    const incomingValue = (incoming as unknown as Record<string, unknown>)[field];
+
+    if (incomingValue === undefined && existingValue !== undefined) {
+      merged[field] = existingValue;
+      continue;
+    }
+
+    if (incomingValue === null && existingValue !== undefined && existingValue !== null) {
+      merged[field] = existingValue;
+      continue;
+    }
+
+    if (field === '__bookmark_folder_name_source') {
+      const incomingSource = String(incomingValue || '');
+      const existingSource = String(existingValue || '');
+      if (incomingSource === 'id-only' && existingSource === 'api') {
+        merged[field] = existingSource;
+      }
+    }
+  }
+
+  return merged as unknown as Tweet;
+}
+
 declare global {
   interface Window {
     __META_DATA__: {
@@ -183,16 +224,28 @@ export class DatabaseManager {
   */
 
   async upsertTweets(tweets: Tweet[]) {
+    if (!tweets.length) {
+      return;
+    }
+
     return this.db
-      .transaction('rw', this.tweets(), () => {
-        const data: Tweet[] = tweets.map((tweet) => ({
-          ...tweet,
-          twe_private_fields: {
-            created_at: +parseTwitterDateTime(tweet.legacy.created_at),
-            updated_at: Date.now(),
-            media_count: extractTweetMedia(tweet).length,
-          },
-        }));
+      .transaction('rw', this.tweets(), async () => {
+        const ids = tweets.map((tweet) => tweet.rest_id);
+        const existingRows = await this.tweets().where('rest_id').anyOf(ids).toArray();
+        const existingById = new Map(existingRows.map((row) => [String(row.rest_id), row]));
+
+        const data: Tweet[] = tweets.map((tweet) => {
+          const normalized = {
+            ...tweet,
+            twe_private_fields: {
+              created_at: +parseTwitterDateTime(tweet.legacy.created_at),
+              updated_at: Date.now(),
+              media_count: extractTweetMedia(tweet).length,
+            },
+          };
+
+          return mergeTweetMetadata(existingById.get(tweet.rest_id) ?? null, normalized);
+        });
 
         return this.tweets().bulkPut(data);
       })

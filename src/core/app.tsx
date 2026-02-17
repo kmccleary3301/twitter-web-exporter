@@ -20,6 +20,12 @@ export function App() {
   const extensions = useSignal<Extension[]>([]);
   const currentTheme = useSignal(options.get('theme'));
   const showControlPanel = useSignal(options.get('showControlPanel'));
+  const hookStats = useSignal<{
+    xhrMessages: number;
+    fetchMessages: number;
+    lastUrl: string;
+    lastAt: number;
+  } | null>(null);
 
   // Remember the last state of the control panel.
   const toggleControlPanel = () => {
@@ -37,10 +43,39 @@ export function App() {
       currentTheme.value = options.get('theme');
     });
 
-    GM_registerMenuCommand(t('Open Control Panel'), toggleControlPanel);
+    if (typeof GM_registerMenuCommand === 'function') {
+      GM_registerMenuCommand(t('Open Control Panel'), toggleControlPanel);
+    }
+
+    // Poll hook health cheaply. This is intentionally read-only and safe.
+    const id = setInterval(() => {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        hookStats.value = (globalThis as any).__twe_hook_stats_v1 ?? null;
+      } catch {
+        hookStats.value = null;
+      }
+    }, 1000);
 
     logger.debug('App useEffect executed');
+    return () => clearInterval(id);
   }, []);
+
+  const hookLine = (() => {
+    const hs = hookStats.value;
+    if (!hs) return 'Hooks: unknown';
+    const ageSec = hs.lastAt ? Math.max(0, Math.floor((Date.now() - hs.lastAt) / 1000)) : null;
+    let short = hs.lastUrl || '';
+    try {
+      const u = new URL(short);
+      short = `${u.hostname}${u.pathname}`;
+    } catch {
+      // ignore
+    }
+    if (short.length > 48) short = short.slice(0, 45) + '...';
+    const age = ageSec === null ? '' : ` (${ageSec}s ago)`;
+    return `Hooks: xhr ${hs.xhrMessages}, fetch ${hs.fetchMessages}` + (hs.lastUrl ? `, last ${short}${age}` : '');
+  })();
 
   return (
     <Fragment>
@@ -78,6 +113,9 @@ export function App() {
         </header>
         <p class="text-sm text-base-content text-opacity-70 mb-1 leading-none">
           {t('Browse around to capture more data.')}
+        </p>
+        <p class="text-xs text-base-content text-opacity-60 mb-1 leading-none font-mono">
+          {hookLine}
         </p>
         <div class="divider mt-0 mb-0"></div>
         {/* Extensions UI. */}

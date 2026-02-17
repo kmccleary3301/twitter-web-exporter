@@ -34,6 +34,20 @@ const quoteSourceAccessor = (row: Tweet) => {
   return source ? extractTweetUserScreenName(source) : null;
 };
 
+// Folder names are trusted only when sourced from BookmarkFoldersSlice API.
+const bookmarkFolderNameAccessor = (row: Tweet) => {
+  const obj = row as unknown as Record<string, unknown>;
+  const source = obj.__bookmark_folder_name_source;
+  const name = obj.__bookmark_folder_name;
+  if (source === 'api' && typeof name === 'string' && name.trim()) return name;
+  return null;
+};
+
+const bookmarkFolderIdAccessor = (row: Tweet) => {
+  const id = (row as unknown as Record<string, unknown>).__bookmark_folder_id;
+  return typeof id === 'string' && id.trim() ? id : null;
+};
+
 /**
  * Table columns definition for tweets.
  */
@@ -314,6 +328,38 @@ export const columns = [
     meta: { exportKey: 'bookmarked', exportHeader: 'Bookmarked' },
     header: () => <Trans i18nKey="Bookmarked" />,
     cell: (info) => <p>{info.getValue() ? 'YES' : 'NO'}</p>,
+  }),
+  columnHelper.accessor(bookmarkFolderNameAccessor, {
+    id: 'bookmark_folder_name',
+    meta: {
+      exportKey: 'bookmark_folder_name',
+      exportHeader: 'Bookmark Folder',
+      exportValue: (row) => bookmarkFolderNameAccessor(row.original),
+    },
+    header: () => <Trans i18nKey="Bookmark Folder" />,
+    cell: (info) => {
+      const val = info.getValue();
+      return val ? (
+        <p class="w-36 truncate" title={String(val)}>
+          {val}
+        </p>
+      ) : (
+        <p class="text-gray-400">—</p>
+      );
+    },
+  }),
+  columnHelper.accessor(bookmarkFolderIdAccessor, {
+    id: 'bookmark_folder_id',
+    meta: {
+      exportKey: 'bookmark_folder_id',
+      exportHeader: 'Bookmark Folder ID',
+      exportValue: (row) => bookmarkFolderIdAccessor(row.original),
+    },
+    header: () => <span>Bookmark Folder ID</span>,
+    cell: (info) => {
+      const val = info.getValue();
+      return val ? <p class="w-32 break-all font-mono text-xs">{val}</p> : <p class="text-gray-400">—</p>;
+    },
   }),
   columnHelper.display({
     id: 'url',

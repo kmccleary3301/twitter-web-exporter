@@ -11,6 +11,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:e2e": "tsc && TWE_BUILD_VARIANT=e2e vite build",
     "prepare": "husky",
     "lint": "eslint .",
     "commitlint": "commitlint --edit",

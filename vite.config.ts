@@ -10,6 +10,22 @@ import autoprefixer from 'autoprefixer';
 import prefixSelector from 'postcss-prefix-selector';
 import remToPx from 'postcss-rem-to-pixel-next';
 
+const isE2EBuild =
+  process.env.TWE_BUILD_VARIANT === 'e2e' || process.env.TWE_BUILD_STANDALONE === '1';
+
+const userscriptRequire = [
+  'https://cdn.jsdelivr.net/npm/dayjs@1.11.13/dayjs.min.js',
+  'https://cdn.jsdelivr.net/npm/dexie@4.0.11/dist/dexie.min.js',
+  'https://cdn.jsdelivr.net/npm/dexie-export-import@4.1.4/dist/dexie-export-import.js',
+  'https://cdn.jsdelivr.net/npm/file-saver-es@2.0.5/dist/FileSaver.min.js',
+  'https://cdn.jsdelivr.net/npm/i18next@24.2.3/i18next.min.js',
+  'https://cdn.jsdelivr.net/npm/preact@10.26.4/dist/preact.min.js',
+  'https://cdn.jsdelivr.net/npm/preact@10.26.4/hooks/dist/hooks.umd.js',
+  'https://cdn.jsdelivr.net/npm/@preact/signals-core@1.8.0/dist/signals-core.min.js',
+  'https://cdn.jsdelivr.net/npm/@preact/signals@2.0.0/dist/signals.min.js',
+  'https://cdn.jsdelivr.net/npm/@tanstack/table-core@8.21.2/build/umd/index.production.js',
+];
+
 // https://vitejs.dev/config/
 export default defineConfig({
   resolve: {
@@ -57,35 +73,43 @@ export default defineConfig({
         match: ['*://twitter.com/*', '*://x.com/*', '*://mobile.x.com/*'],
         grant: ['unsafeWindow'],
         'run-at': 'document-start',
+        // NOTE: X.com currently enforces a strict CSP that can block page-context injection
+        // by userscript managers (Violentmonkey inject-into=page). Use content injection
+        // and rely on unsafeWindow-based patching instead.
+        //
+        // If we need true page-context execution again, we likely need a dedicated extension
+        // or an injection approach that is not subject to page CSP.
+        //
+        // 2026-02: We need page-context hooks to avoid Firefox cross-compartment errors
+        // when monkeypatching fetch/XHR ("Permission denied to access property length").
+        // Violentmonkey can inject into page using extension mechanisms; if CSP blocks in
+        // some environments, we can re-introduce a content fallback.
+        'inject-into': 'page',
         updateURL:
           'https://github.com/prinsss/twitter-web-exporter/releases/latest/download/twitter-web-exporter.user.js',
         downloadURL:
           'https://github.com/prinsss/twitter-web-exporter/releases/latest/download/twitter-web-exporter.user.js',
-        require: [
-          'https://cdn.jsdelivr.net/npm/dayjs@1.11.13/dayjs.min.js',
-          'https://cdn.jsdelivr.net/npm/dexie@4.0.11/dist/dexie.min.js',
-          'https://cdn.jsdelivr.net/npm/dexie-export-import@4.1.4/dist/dexie-export-import.js',
-          'https://cdn.jsdelivr.net/npm/file-saver-es@2.0.5/dist/FileSaver.min.js',
-          'https://cdn.jsdelivr.net/npm/i18next@24.2.3/i18next.min.js',
-          'https://cdn.jsdelivr.net/npm/preact@10.26.4/dist/preact.min.js',
-          'https://cdn.jsdelivr.net/npm/preact@10.26.4/hooks/dist/hooks.umd.js',
-          'https://cdn.jsdelivr.net/npm/@preact/signals-core@1.8.0/dist/signals-core.min.js',
-          'https://cdn.jsdelivr.net/npm/@preact/signals@2.0.0/dist/signals.min.js',
-          'https://cdn.jsdelivr.net/npm/@tanstack/table-core@8.21.2/build/umd/index.production.js',
-        ],
+        ...(isE2EBuild ? {} : { require: userscriptRequire }),
       },
       build: {
-        externalGlobals: {
-          dayjs: 'dayjs',
-          dexie: 'Dexie',
-          'dexie-export-import': 'DexieExportImport',
-          'file-saver-es': 'FileSaver',
-          i18next: 'i18next',
-          preact: 'preact',
-          'preact/hooks': 'preactHooks',
-          '@preact/signals': 'preactSignals',
-          '@tanstack/table-core': 'TableCore',
-        },
+        ...(isE2EBuild
+          ? {
+              fileName: 'twitter-web-exporter-e2e.user.js',
+            }
+          : {
+              fileName: 'twitter-web-exporter.user.js',
+              externalGlobals: {
+                dayjs: 'dayjs',
+                dexie: 'Dexie',
+                'dexie-export-import': 'DexieExportImport',
+                'file-saver-es': 'FileSaver',
+                i18next: 'i18next',
+                preact: 'preact',
+                'preact/hooks': 'preactHooks',
+                '@preact/signals': 'preactSignals',
+                '@tanstack/table-core': 'TableCore',
+              },
+            }),
       },
     }),
   ],

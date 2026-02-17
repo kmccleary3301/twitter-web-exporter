@@ -23,6 +23,10 @@ import UserTweetsModule from './modules/user-tweets';
 
 import './index.css';
 
+const APP_ROOT_ID = 'twe-root';
+const APP_ROOT_MOUNTED_FLAG = '__twe_root_mounted_v1';
+const windowScope = globalThis as unknown as Record<string, unknown>;
+
 extensions.add(FollowersModule);
 extensions.add(FollowingModule);
 extensions.add(UserDetailModule);
@@ -44,9 +48,21 @@ extensions.add(RuntimeLogsModule);
 extensions.start();
 
 function mountApp() {
-  const root = document.createElement('div');
-  root.id = 'twe-root';
-  document.body.append(root);
+  const existingRoot = document.getElementById(APP_ROOT_ID) as HTMLDivElement | null;
+  if (windowScope[APP_ROOT_MOUNTED_FLAG]) {
+    if (existingRoot) {
+      return;
+    }
+    windowScope[APP_ROOT_MOUNTED_FLAG] = false;
+  }
+
+  const root = existingRoot ?? document.createElement('div');
+  if (!existingRoot) {
+    root.id = APP_ROOT_ID;
+    document.body.append(root);
+  }
+
+  windowScope[APP_ROOT_MOUNTED_FLAG] = true;
 
   render(<App />, root);
 }

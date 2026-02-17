@@ -2,9 +2,11 @@ import {
   ItemContentUnion,
   Media,
   Tag,
+  TimelineAddToModuleInstruction,
   TimelineAddEntriesInstruction,
   TimelineEntry,
   TimelineInstructions,
+  TimelinePinEntryInstruction,
   TimelineTimelineItem,
   TimelineTimelineModule,
   TimelineTweet,
@@ -35,26 +37,101 @@ export function extractDataFromResponse<
 ): T[] {
   const json: R = JSON.parse(response.responseText);
   const instructions = extractInstructionsFromJson(json);
-
-  const timelineAddEntriesInstruction = instructions.find(
-    (i) => i.type === 'TimelineAddEntries',
-  ) as TimelineAddEntriesInstruction<P>;
-
-  // The "TimelineAddEntries" instruction may not exist in some cases.
-  const timelineAddEntriesInstructionEntries = timelineAddEntriesInstruction?.entries ?? [];
-
+  const timelineEntries = extractTimelineItemEntries<P>(instructions);
+  const seenRestIds = new Set<string>();
   const newData: T[] = [];
 
-  for (const entry of timelineAddEntriesInstructionEntries) {
-    if (isTimelineEntryItem<P>(entry)) {
-      const data = extractDataFromTimelineEntry(entry);
-      if (data) {
-        newData.push(data);
-      }
-    }
+  for (const entry of timelineEntries) {
+    const data = extractDataFromTimelineEntry(entry);
+    if (!data || seenRestIds.has(data.rest_id)) continue;
+    seenRestIds.add(data.rest_id);
+    newData.push(data);
   }
 
   return newData;
+}
+
+function extractTimelineItemEntries<P extends ItemContentUnion>(
+  instructions: TimelineInstructions,
+): TimelineEntry<P, TimelineTimelineItem<P>>[] {
+  const entries: TimelineEntry<P, TimelineTimelineItem<P>>[] = [];
+
+  for (const instruction of instructions) {
+    if (instruction.type === 'TimelineAddEntries') {
+      const addEntriesInstruction = instruction as TimelineAddEntriesInstruction<P>;
+      for (const entry of addEntriesInstruction.entries ?? []) {
+        if (isTimelineEntryItem<P>(entry)) {
+          entries.push(entry);
+        }
+      }
+      continue;
+    }
+
+    if (instruction.type === 'TimelinePinEntry') {
+      const pinInstruction = instruction as TimelinePinEntryInstruction;
+      const entry = pinInstruction.entry as TimelineEntry<P>;
+      if (entry && isTimelineEntryItem<P>(entry)) {
+        entries.push(entry);
+      }
+      continue;
+    }
+
+    if (instruction.type === 'TimelineAddToModule') {
+      const addToModuleInstruction = instruction as TimelineAddToModuleInstruction<P>;
+      for (const moduleItem of addToModuleInstruction.moduleItems ?? []) {
+        const itemContent = moduleItem?.item?.itemContent as P | undefined;
+        if (!itemContent) continue;
+        entries.push({
+          entryId: moduleItem.entryId ?? '',
+          sortIndex: '0',
+          content: {
+            entryType: 'TimelineTimelineItem',
+            __typename: 'TimelineTimelineItem',
+            itemContent,
+            clientEventInfo: moduleItem?.item?.clientEventInfo ?? null,
+          },
+        });
+      }
+      continue;
+    }
+
+    // Fallback: X frequently experiments with new instruction types. Many still
+    // contain `entries` / `entry` / `moduleItems` payloads. Try to extract those
+    // conservatively so we don't miss spliced/inserted timeline items.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const instAny = instruction as any;
+    if (Array.isArray(instAny?.entries)) {
+      for (const entry of instAny.entries) {
+        if (entry && isTimelineEntryItem<P>(entry)) {
+          entries.push(entry);
+        }
+      }
+      continue;
+    }
+    if (instAny?.entry && isTimelineEntryItem<P>(instAny.entry)) {
+      entries.push(instAny.entry);
+      continue;
+    }
+    if (Array.isArray(instAny?.moduleItems)) {
+      for (const moduleItem of instAny.moduleItems ?? []) {
+        const itemContent = moduleItem?.item?.itemContent as P | undefined;
+        if (!itemContent) continue;
+        entries.push({
+          entryId: moduleItem.entryId ?? '',
+          sortIndex: '0',
+          content: {
+            entryType: 'TimelineTimelineItem',
+            __typename: 'TimelineTimelineItem',
+            itemContent,
+            clientEventInfo: moduleItem?.item?.clientEventInfo ?? null,
+          },
+        });
+      }
+      continue;
+    }
+  }
+
+  return entries;
 }
 
 /**

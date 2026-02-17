@@ -35,9 +35,11 @@ export function Settings() {
   };
 
   useEffect(() => {
-    GM_registerMenuCommand(`${t('Version')} ${packageJson.version}`, () => {
-      window.open(packageJson.homepage, '_blank');
-    });
+    if (typeof GM_registerMenuCommand === 'function') {
+      GM_registerMenuCommand(`${t('Version')} ${packageJson.version}`, () => {
+        window.open(packageJson.homepage, '_blank');
+      });
+    }
   }, []);
 
   return (
