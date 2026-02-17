@@ -86,7 +86,11 @@ function isTimelineContainer(value: unknown): value is TimelineContainer {
   return Array.isArray(inst);
 }
 
-function findTimelineInstructionsFromObject(value: unknown, depth = 0, seen = new Set<object>()): TimelineInstructions | null {
+function findTimelineInstructionsFromObject(
+  value: unknown,
+  depth = 0,
+  seen = new Set<object>(),
+): TimelineInstructions | null {
   if (!value || typeof value !== 'object') return null;
   if (depth > 5) return null;
 
@@ -137,8 +141,7 @@ function findFolderId(value: unknown): string | null {
   const seen = new Set<object>();
 
   function walk(node: unknown, currentKey?: string): string | null {
-    const byKey =
-      currentKey && isFolderOrCollectionKey(currentKey) ? coerceFolderId(node) : null;
+    const byKey = currentKey && isFolderOrCollectionKey(currentKey) ? coerceFolderId(node) : null;
     if (byKey) return byKey;
 
     if (!node || typeof node !== 'object') {
@@ -175,7 +178,10 @@ function extractTimelineInstructions(json: BookmarksResponse): TimelineInstructi
     json.data?.bookmark_collection_timeline?.timeline ||
     (json as unknown as { timeline?: { instructions?: TimelineInstructions } }).timeline;
 
-  if (timeline && Array.isArray((timeline as { instructions?: TimelineInstructions }).instructions)) {
+  if (
+    timeline &&
+    Array.isArray((timeline as { instructions?: TimelineInstructions }).instructions)
+  ) {
     return (timeline as { instructions: TimelineInstructions }).instructions;
   }
 
@@ -316,7 +322,7 @@ function resolveFolderFromContext(rawContext: unknown): string | null {
   // Handle BookmarkContextPayload structure directly
   if (typeof rawContext === 'object' && rawContext !== null) {
     const obj = rawContext as Record<string, unknown>;
-    
+
     // Direct folderId property (from BookmarkContextPayload)
     if (typeof obj.folderId === 'string' && /^\d+$/.test(obj.folderId)) {
       return obj.folderId;
@@ -324,7 +330,7 @@ function resolveFolderFromContext(rawContext: unknown): string | null {
     if (typeof obj.folderId === 'number' && Number.isFinite(obj.folderId)) {
       return String(Math.trunc(obj.folderId));
     }
-    
+
     // Direct folder_id property
     if (typeof obj.folder_id === 'string' && /^\d+$/.test(obj.folder_id)) {
       return obj.folder_id;
@@ -338,13 +344,9 @@ function resolveFolderFromContext(rawContext: unknown): string | null {
     if (found) return found;
 
     // Extract from URL properties
-    const pageUrl = [
-      obj.pageUrl,
-      obj.url,
-      obj.location,
-      obj.currentUrl,
-      obj.folderUrl,
-    ].find((value): value is string => typeof value === 'string');
+    const pageUrl = [obj.pageUrl, obj.url, obj.location, obj.currentUrl, obj.folderUrl].find(
+      (value): value is string => typeof value === 'string',
+    );
 
     if (typeof pageUrl === 'string') {
       const byUrl = extractFolderIdFromUrl(pageUrl);
@@ -704,8 +706,7 @@ interface BookmarkFoldersSliceResponse {
 function parseBookmarkFoldersSlice(text: string): void {
   try {
     const json = JSON.parse(text) as BookmarkFoldersSliceResponse;
-    const items =
-      json.data?.viewer?.user_results?.result?.bookmark_collections_slice?.items ?? [];
+    const items = json.data?.viewer?.user_results?.result?.bookmark_collections_slice?.items ?? [];
     let changed = false;
     for (const item of items) {
       if (item.id && typeof item.name === 'string') {
@@ -731,7 +732,11 @@ export const BookmarksInterceptor: Interceptor = (req, res, ext) => {
     if (text) parseBookmarkFoldersSlice(text);
     return;
   }
-  if (!/\/graphql\/.+\/(Bookmarks|BookmarkFolderTimeline|BookmarkCollectionTimeline|BookmarkCollectionsTimeline)/.test(req.url)) {
+  if (
+    !/\/graphql\/.+\/(Bookmarks|BookmarkFolderTimeline|BookmarkCollectionTimeline|BookmarkCollectionsTimeline)/.test(
+      req.url,
+    )
+  ) {
     return;
   }
 

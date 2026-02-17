@@ -62,9 +62,14 @@ export function ExportDataModal<T>({ title, table, show, onClose }: ExportDataMo
 
       // Promote bookmark folder fields to top-level for easy indexing (from BookmarksInterceptor)
       const orig = row.original as Record<string, unknown>;
-      if (orig && (orig.__bookmark_folder_id || orig.__bookmark_folder_name || orig.__bookmark_folder_url)) {
+      if (
+        orig &&
+        (orig.__bookmark_folder_id || orig.__bookmark_folder_name || orig.__bookmark_folder_url)
+      ) {
         const trustedFolderName =
-          orig.__bookmark_folder_name_source === 'api' ? (orig.__bookmark_folder_name ?? null) : null;
+          orig.__bookmark_folder_name_source === 'api'
+            ? (orig.__bookmark_folder_name ?? null)
+            : null;
         record.bookmark_folder_id = orig.__bookmark_folder_id ?? null;
         record.bookmark_folder_name = trustedFolderName;
         record.bookmark_folder_url = orig.__bookmark_folder_url ?? null;

@@ -74,7 +74,10 @@ export function App() {
     }
     if (short.length > 48) short = short.slice(0, 45) + '...';
     const age = ageSec === null ? '' : ` (${ageSec}s ago)`;
-    return `Hooks: xhr ${hs.xhrMessages}, fetch ${hs.fetchMessages}` + (hs.lastUrl ? `, last ${short}${age}` : '');
+    return (
+      `Hooks: xhr ${hs.xhrMessages}, fetch ${hs.fetchMessages}` +
+      (hs.lastUrl ? `, last ${short}${age}` : '')
+    );
   })();
 
   return (

@@ -10,14 +10,23 @@ import { Extension, ExtensionConstructor } from './extension';
 const unsafe = unsafeWindow ?? null;
 // In Firefox (WebExtension content scripts), page objects are often Xray-wrapped.
 // Prefer `wrappedJSObject` to access the real page realm.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const pageWindow = unsafe && (unsafe as any).wrappedJSObject ? (unsafe as any).wrappedJSObject : null;
-const hookGlobalObject = pageWindow ?? unsafe ?? window ?? globalThis;
+const unsafeObject = unsafe as { wrappedJSObject?: unknown } | null;
+const pageWindow =
+  unsafeObject && unsafeObject.wrappedJSObject && typeof unsafeObject.wrappedJSObject === 'object'
+    ? (unsafeObject.wrappedJSObject as Window & typeof globalThis)
+    : null;
+type HookGlobal = Window & typeof globalThis & Record<string, unknown>;
+const hookGlobalObject = (pageWindow ?? unsafe ?? window ?? globalThis) as unknown as HookGlobal;
 
-type ExportFunction = (fn: Function, target: object, options?: { defineAs?: string }) => unknown;
+type HookCallable = (...args: unknown[]) => unknown;
+type ExportFunction = (
+  fn: HookCallable,
+  target: object,
+  options?: { defineAs?: string },
+) => unknown;
 // Firefox-only: `exportFunction` makes functions callable from the page realm.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const exportFunctionMaybe = (globalThis as any).exportFunction as ExportFunction | undefined;
+const exportFunctionMaybe = (globalThis as unknown as { exportFunction?: unknown })
+  .exportFunction as ExportFunction | undefined;
 
 const HOOK_MESSAGE_FLAG = '__twe_mcp_hook_v1';
 const ORIG_XHR_OPEN_KEY = '__twe_orig_xhr_open_v1';
@@ -29,7 +38,6 @@ const BOOKMARK_CONTEXT_KEY = '__twe_bookmark_context_v1';
 const BOOKMARK_CONTEXT_DUMP_KEY = '__twe_bookmark_context_dump_v1';
 const HOOK_BOOTSTRAP_ERROR_KEY = '__twe_bootstrap_error_v1';
 const HOOK_RUNTIME_SIGNATURE = 'twitter-web-exporter-hook-v1';
-const BOOKMARK_CONTEXT_STALE_WINDOW_MS = 15000;
 const BOOKMARK_CONTEXT_BOOKMARKS_ONLY_STALE_MS = 45000;
 const BOOKMARK_CONTEXT_LOCK_TTL_MS = 180000;
 const BOOKMARK_CONTEXT_SCAN_DEPTH = 6;
@@ -169,13 +177,22 @@ type BookmarkRequestSource = {
   body?: string;
 };
 
+type HookedXhr = XMLHttpRequest & {
+  __twe_req_method_v1?: string;
+  __twe_req_url_v1?: string;
+  __twe_req_body_v1?: string;
+  __twe_req_id_v1?: string;
+  __twe_req_bookmark_context_v1?: BookmarkContextPayload | null;
+  __twe_hooked_v1?: boolean;
+};
+
 type InterceptedRequest = {
   method: string;
   url: string;
   body?: string;
   bookmarkContext?: unknown;
   requestId?: string;
-  // eslint-disable-next-line @typescript-eslint/naming-convention
+
   __twe_hook_revision_v1?: number;
   hookRevision?: number;
 };
@@ -188,7 +205,11 @@ type BootstrapErrorReport = {
   at: number;
 };
 
-function recordBootstrapError(phase: string, instanceId: string, error: unknown): BootstrapErrorReport {
+function recordBootstrapError(
+  phase: string,
+  instanceId: string,
+  error: unknown,
+): BootstrapErrorReport {
   const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
   const stack = error instanceof Error ? error.stack : undefined;
   const report: BootstrapErrorReport = {
@@ -216,8 +237,7 @@ function clearBootstrapErrorMarker(): void {
     const g = hookGlobalObject as Record<string, unknown>;
     const deleted = (obj: unknown, key: string) => {
       if (obj && typeof obj === 'object') {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        delete (obj as any)[key];
+        delete (obj as Record<string, unknown>)[key];
       }
     };
 
@@ -256,9 +276,8 @@ function publishHookGlobals(hookStats: HookStats, runtimePayload: Record<string,
     try {
       target[HOOK_STATS_KEY] = hookStats;
       const existing = target[HOOK_RUNTIME_KEY];
-      const existingObject = existing && typeof existing === 'object'
-        ? existing as Record<string, unknown>
-        : {};
+      const existingObject =
+        existing && typeof existing === 'object' ? (existing as Record<string, unknown>) : {};
       target[HOOK_RUNTIME_KEY] = {
         ...existingObject,
         ...runtimePayload,
@@ -290,10 +309,15 @@ function normalizeRuntimeForRead(value: unknown, fallback: HookStats): HookStats
     responsesProcessed: Number(candidate.responsesProcessed) || 0,
     responsesSkippedDuplicate: Number(candidate.responsesSkippedDuplicate) || 0,
     lastMessageAt: Number(candidate.lastMessageAt) || 0,
-    activeInstanceId: typeof candidate.activeInstanceId === 'string' ? candidate.activeInstanceId : fallback.activeInstanceId,
+    activeInstanceId:
+      typeof candidate.activeInstanceId === 'string'
+        ? candidate.activeInstanceId
+        : fallback.activeInstanceId,
     rev: Number(candidate.rev) || HOOK_REVISION,
     repairCount: Number(candidate.repairCount) || 0,
-    endpointStats: candidate.endpointStats as Record<string, EndpointHookMetrics> | undefined || Object.create(null),
+    endpointStats:
+      (candidate.endpointStats as Record<string, EndpointHookMetrics> | undefined) ||
+      Object.create(null),
   };
 }
 
@@ -353,17 +377,17 @@ function hasHookShape(
   const source = toPlainFunctionSource(target);
   if (!source) return false;
   return (
-    source.includes('__twe_mcp_hook_v1')
-    || source.includes('__twe_is_hook_open_v1')
-    || source.includes('__twe_is_hook_send_v1')
-    || source.includes('__twe_is_hook_fetch_v1')
-    || source.includes('__twe_is_hook_revision_v1')
-    || source.includes('__twe_orig_xhr_open_v1')
-    || source.includes('__twe_orig_xhr_send_v1')
-    || source.includes('__twe_orig_fetch_v1')
-    || source.includes('__twe_req_body_v1')
-    || source.includes('__twe_req_url_v1')
-    || source.includes('__twe_req_bookmark_context_v1')
+    source.includes('__twe_mcp_hook_v1') ||
+    source.includes('__twe_is_hook_open_v1') ||
+    source.includes('__twe_is_hook_send_v1') ||
+    source.includes('__twe_is_hook_fetch_v1') ||
+    source.includes('__twe_is_hook_revision_v1') ||
+    source.includes('__twe_orig_xhr_open_v1') ||
+    source.includes('__twe_orig_xhr_send_v1') ||
+    source.includes('__twe_orig_fetch_v1') ||
+    source.includes('__twe_req_body_v1') ||
+    source.includes('__twe_req_url_v1') ||
+    source.includes('__twe_req_bookmark_context_v1')
   );
 }
 
@@ -381,7 +405,12 @@ function normalizeContextDumpList(current: unknown): BookmarkContextDumpEntry[] 
 
   for (const item of current) {
     const candidate = item as Partial<BookmarkContextDumpEntry>;
-    if (candidate && typeof candidate.requestId === 'string' && typeof candidate.ts === 'number' && typeof candidate.url === 'string') {
+    if (
+      candidate &&
+      typeof candidate.requestId === 'string' &&
+      typeof candidate.ts === 'number' &&
+      typeof candidate.url === 'string'
+    ) {
       out.push({
         requestId: candidate.requestId,
         ts: candidate.ts,
@@ -391,28 +420,39 @@ function normalizeContextDumpList(current: unknown): BookmarkContextDumpEntry[] 
         confidenceSource:
           typeof candidate.confidenceSource === 'string' && candidate.confidenceSource
             ? candidate.confidenceSource
-            : (typeof candidate.context?.source === 'string' ? candidate.context.source : 'unknown'),
+            : typeof candidate.context?.source === 'string'
+              ? candidate.context.source
+              : 'unknown',
         context: {
           folderId:
             typeof candidate.context?.folderId === 'string' ? candidate.context.folderId : null,
           pageUrl: typeof candidate.context?.pageUrl === 'string' ? candidate.context.pageUrl : '',
-          source: typeof candidate.context?.source === 'string' ? candidate.context.source : 'unknown',
+          source:
+            typeof candidate.context?.source === 'string' ? candidate.context.source : 'unknown',
           capturedAt:
-            typeof candidate.context?.capturedAt === 'number' ? candidate.context.capturedAt : Date.now(),
-          requestId: typeof candidate.context?.requestId === 'string' ? candidate.context.requestId : undefined,
+            typeof candidate.context?.capturedAt === 'number'
+              ? candidate.context.capturedAt
+              : Date.now(),
+          requestId:
+            typeof candidate.context?.requestId === 'string'
+              ? candidate.context.requestId
+              : undefined,
           routeSource:
-            typeof candidate.context?.routeSource === 'string' ? candidate.context.routeSource : undefined,
+            typeof candidate.context?.routeSource === 'string'
+              ? candidate.context.routeSource
+              : undefined,
           pageRouteUrl:
-            typeof candidate.context?.pageRouteUrl === 'string' ? candidate.context.pageRouteUrl : undefined,
+            typeof candidate.context?.pageRouteUrl === 'string'
+              ? candidate.context.pageRouteUrl
+              : undefined,
         },
-        normalizedRoute: typeof candidate.normalizedRoute === 'string' ? candidate.normalizedRoute : '',
+        normalizedRoute:
+          typeof candidate.normalizedRoute === 'string' ? candidate.normalizedRoute : '',
       });
     }
   }
 
-  return out
-    .sort((a, b) => b.ts - a.ts)
-    .slice(0, BOOKMARK_CONTEXT_DUMP_LIMIT);
+  return out.sort((a, b) => b.ts - a.ts).slice(0, BOOKMARK_CONTEXT_DUMP_LIMIT);
 }
 
 function appendBookmarkContextDump(entry: BookmarkContextDumpEntry) {
@@ -426,7 +466,7 @@ function appendBookmarkContextDump(entry: BookmarkContextDumpEntry) {
     confidenceSource:
       typeof entry.confidenceSource === 'string' && entry.confidenceSource
         ? entry.confidenceSource
-        : (entry.context?.source || 'unknown'),
+        : entry.context?.source || 'unknown',
     context: {
       folderId: entry.context?.folderId ?? null,
       pageUrl: entry.context?.pageUrl || '',
@@ -505,7 +545,9 @@ function getBookmarkContextLock(now = Date.now()): BookmarkContextPayload | null
     const candidate = raw as Partial<BookmarkContextPayload>;
     if (typeof candidate.folderId !== 'string' || !candidate.folderId) continue;
     const capturedAt =
-      typeof candidate.capturedAt === 'number' && Number.isFinite(candidate.capturedAt) ? candidate.capturedAt : 0;
+      typeof candidate.capturedAt === 'number' && Number.isFinite(candidate.capturedAt)
+        ? candidate.capturedAt
+        : 0;
     if (!capturedAt || now - capturedAt > BOOKMARK_CONTEXT_LOCK_TTL_MS) {
       continue;
     }
@@ -541,14 +583,14 @@ function resolveCanonicalRouteFromUrl(url: string): { folderId: string | null; p
 }
 
 function markHookFunction(
-  fn: Function,
+  fn: unknown,
   marker: '__twe_is_hook_open_v1' | '__twe_is_hook_send_v1' | '__twe_is_hook_fetch_v1',
 ) {
+  if (typeof fn !== 'function') return;
   try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const anyFn = fn as any;
-    anyFn[marker] = true;
-    anyFn.__twe_is_hook_revision_v1 = HOOK_REVISION;
+    const hookFn = fn as HookCallable & Record<string, unknown>;
+    hookFn[marker] = true;
+    hookFn.__twe_is_hook_revision_v1 = HOOK_REVISION;
   } catch {
     // ignore
   }
@@ -581,7 +623,10 @@ function normalizeHookPayloadRequest(rawReq: unknown): InterceptedRequest {
     normalized.requestId = req.requestId;
   }
 
-  if (typeof req.__twe_hook_revision_v1 === 'number' && Number.isFinite(req.__twe_hook_revision_v1)) {
+  if (
+    typeof req.__twe_hook_revision_v1 === 'number' &&
+    Number.isFinite(req.__twe_hook_revision_v1)
+  ) {
     normalized.hookRevision = req.__twe_hook_revision_v1;
   }
 
@@ -632,46 +677,15 @@ function getBridgeMessageRevision(rawMessage: unknown): number | null {
     return Number(envelope.__twe_msg_revision_v1);
   }
 
-  if (req && typeof req === 'object' && typeof (req as { __twe_hook_revision_v1?: unknown }).__twe_hook_revision_v1 === 'number') {
+  if (
+    req &&
+    typeof req === 'object' &&
+    typeof (req as { __twe_hook_revision_v1?: unknown }).__twe_hook_revision_v1 === 'number'
+  ) {
     return Number((req as { __twe_hook_revision_v1?: unknown }).__twe_hook_revision_v1);
   }
 
   return null;
-}
-
-function resolveAndDumpBookmarkContext(
-  method: string,
-  url: string,
-  body?: string,
-  request?: BookmarkRequestSource,
-): { requestId: string; context: BookmarkContextPayload } {
-  const requestId =
-    typeof request?.requestId === 'string' && request.requestId.length > 0
-      ? request.requestId
-      : nextBookmarkRequestId();
-  const requestMeta: BookmarkRequestSource = {
-    method,
-    url,
-    body: body,
-    requestId,
-  };
-  const context = resolveRequestBookmarkContext(url, body, requestMeta);
-  appendBookmarkContextDump({
-    requestId,
-    ts: Date.now(),
-    method,
-    url,
-    hasBody: !!body,
-    confidenceSource: context.source || 'unknown',
-    context,
-    normalizedRoute: resolveCanonicalRouteFromUrl(url).pageUrl,
-  });
-  return { requestId, context };
-}
-
-function hasBookmarkApiShape(method: string, url: string): boolean {
-  const parsed = url.toLowerCase();
-  return /(\/(api|graphql)\/)|\/(api\/1\.1\/)\.?(search)?/.test(method + ' ' + parsed);
 }
 
 function createEndpointMetrics(): EndpointHookMetrics {
@@ -748,7 +762,9 @@ function serializeRequestBodyText(body: unknown): string | undefined {
   return undefined;
 }
 
-function captureBookmarkRouteFromUrl(url: string): { folderId: string | null; pageUrl: string } | null {
+function captureBookmarkRouteFromUrl(
+  url: string,
+): { folderId: string | null; pageUrl: string } | null {
   try {
     const u = new URL(url, 'https://x.com');
     const match = u.pathname.match(/\/bookmarks\/(\d+)/);
@@ -872,9 +888,9 @@ function extractFolderIdFromRequestVariables(raw: string | null): string | null 
 function extractFolderIdFromBookmarkRequestUrl(url: string): string | null {
   try {
     const u = new URL(url, 'https://x.com');
-    const directQueryId = BOOKMARK_QUERY_FOLDER_KEYS
-      .map((key) => u.searchParams.get(key))
-      .find((value) => !!value && /^\d+$/.test(value));
+    const directQueryId = BOOKMARK_QUERY_FOLDER_KEYS.map((key) => u.searchParams.get(key)).find(
+      (value) => !!value && /^\d+$/.test(value),
+    );
     if (directQueryId) {
       return directQueryId;
     }
@@ -933,7 +949,12 @@ function captureBookmarkRouteFromNavigationArgs(args: unknown[]): BookmarkRouteC
   if (!args.length) return null;
   const stateArg = args[0];
   const urlArg = args[2];
-  const urlSource = typeof urlArg === 'string' ? urlArg : typeof urlArg === 'object' && urlArg ? String(urlArg) : null;
+  const urlSource =
+    typeof urlArg === 'string'
+      ? urlArg
+      : typeof urlArg === 'object' && urlArg
+        ? String(urlArg)
+        : null;
   if (urlSource) {
     const fromUrl = captureBookmarkRouteFromUrl(urlSource);
     if (fromUrl?.folderId) {
@@ -950,7 +971,9 @@ function captureBookmarkRouteFromNavigationArgs(args: unknown[]): BookmarkRouteC
   if (fromState?.folderId) {
     const pageUrl =
       fromState.pageUrl ||
-      (urlSource && captureBookmarkRouteFromUrl(urlSource)?.pageUrl ? captureBookmarkRouteFromUrl(urlSource)!.pageUrl : '');
+      (urlSource && captureBookmarkRouteFromUrl(urlSource)?.pageUrl
+        ? captureBookmarkRouteFromUrl(urlSource)!.pageUrl
+        : '');
     return {
       folderId: fromState.folderId,
       pageUrl: pageUrl || (typeof location !== 'undefined' ? location.href : ''),
@@ -997,7 +1020,8 @@ function captureBookmarkRouteFromBookmarkTabs(): BookmarkRouteCandidate | null {
     '[data-testid="primaryColumn"] a[href*="/bookmarks/"]',
     'a[href*="/bookmarks/"]',
   ];
-  const activeTabs: Array<{ folderId: string; pageUrl: string; source: string; score: number }> = [];
+  const activeTabs: Array<{ folderId: string; pageUrl: string; source: string; score: number }> =
+    [];
   const allTabs: Array<{ folderId: string; pageUrl: string; source: string; score: number }> = [];
   const seen = new Set<string>();
 
@@ -1037,14 +1061,14 @@ function captureBookmarkRouteFromBookmarkTabs(): BookmarkRouteCandidate | null {
       const isAnchorTab =
         anchorOrFallback instanceof HTMLAnchorElement &&
         (anchorOrFallback.role === 'tab' || !!anchorOrFallback.closest('[role="tab"]'));
-      
+
       let style: CSSStyleDeclaration | null = null;
       try {
         style = window.getComputedStyle(anchorOrFallback);
       } catch {
         // ignore
       }
-      const isVisible = style 
+      const isVisible = style
         ? style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'
         : true;
 
@@ -1085,7 +1109,10 @@ function captureBookmarkRouteFromBookmarkTabs(): BookmarkRouteCandidate | null {
     folderId: top.folderId,
     pageUrl: top.pageUrl,
     source: top.source,
-    confidence: Math.max(activeTabs.length > 0 ? 45 : 25, top.score + (activeTabs.length > 0 ? 45 : 25)),
+    confidence: Math.max(
+      activeTabs.length > 0 ? 45 : 25,
+      top.score + (activeTabs.length > 0 ? 45 : 25),
+    ),
   };
 }
 
@@ -1095,9 +1122,7 @@ function captureBookmarkRouteFromHistoryState(): BookmarkRouteCandidate | null {
     if (!state) return null;
     const found = findFolderIdInUnknownValue(state);
     if (!found?.folderId) return null;
-    const pageUrl =
-      found.pageUrl ||
-      (typeof location !== 'undefined' ? location.href : '');
+    const pageUrl = found.pageUrl || (typeof location !== 'undefined' ? location.href : '');
     return { folderId: found.folderId, pageUrl, source: 'history-state', confidence: 86 };
   } catch {
     return null;
@@ -1135,7 +1160,9 @@ function captureBookmarkRouteFromGlobalState(): BookmarkRouteCandidate | null {
   return null;
 }
 
-function captureBookmarkRouteFromEventTarget(target: EventTarget | null): BookmarkRouteCandidate | null {
+function captureBookmarkRouteFromEventTarget(
+  target: EventTarget | null,
+): BookmarkRouteCandidate | null {
   if (!target || typeof target !== 'object') return null;
 
   const candidates: Element[] = [];
@@ -1161,7 +1188,9 @@ function captureBookmarkRouteFromEventTarget(target: EventTarget | null): Bookma
 
   for (const node of candidates) {
     const anchor = node.closest?.('a[href]');
-    const targetNode = (node instanceof HTMLAnchorElement ? node : anchor) as HTMLAnchorElement | null;
+    const targetNode = (
+      node instanceof HTMLAnchorElement ? node : anchor
+    ) as HTMLAnchorElement | null;
     if (!targetNode) continue;
 
     const href = targetNode.getAttribute('href');
@@ -1299,7 +1328,11 @@ function normalizeBookmarkContextValue(
   request?: BookmarkRequestSource & { hasBody?: boolean },
 ): BookmarkContextPayload {
   const fallbackUrl =
-    typeof location !== 'undefined' ? location.href : typeof document !== 'undefined' ? document.URL : '';
+    typeof location !== 'undefined'
+      ? location.href
+      : typeof document !== 'undefined'
+        ? document.URL
+        : '';
   const fallback = {
     folderId: null as string | null,
     pageUrl: fallbackUrl,
@@ -1377,8 +1410,7 @@ function normalizeBookmarkContextValue(
         pageUrl: candidate.pageUrl,
         source:
           typeof asObj.source === 'string' && asObj.source.length > 0 ? asObj.source : 'object',
-        capturedAt:
-          typeof asObj.capturedAt === 'number' ? asObj.capturedAt : now,
+        capturedAt: typeof asObj.capturedAt === 'number' ? asObj.capturedAt : now,
         requestId: request?.requestId,
         routeSource:
           typeof asObj.source === 'string' && asObj.source.length > 0 ? asObj.source : 'object',
@@ -1392,8 +1424,7 @@ function normalizeBookmarkContextValue(
         pageUrl,
         source:
           typeof asObj.source === 'string' && asObj.source.length > 0 ? asObj.source : 'object',
-        capturedAt:
-          typeof asObj.capturedAt === 'number' ? asObj.capturedAt : now,
+        capturedAt: typeof asObj.capturedAt === 'number' ? asObj.capturedAt : now,
         requestId: request?.requestId,
         routeSource:
           typeof asObj.source === 'string' && asObj.source.length > 0 ? asObj.source : 'object',
@@ -1443,24 +1474,25 @@ function captureBookmarkRouteFromPage(): BookmarkRouteCandidate | null {
   const documentUrl = typeof document !== 'undefined' ? document.URL : '';
   const canonical =
     typeof document !== 'undefined'
-      ? (document.querySelector('link[rel=\"canonical\"]') as HTMLLinkElement | null)
+      ? (document.querySelector('link[rel="canonical"]') as HTMLLinkElement | null)
       : null;
   const og =
     typeof document !== 'undefined'
-      ? (document.querySelector('meta[property=\"og:url\"]') as HTMLMetaElement | null)
+      ? (document.querySelector('meta[property="og:url"]') as HTMLMetaElement | null)
       : null;
 
   if (locationUrl) urlCandidates.push({ source: 'location', url: locationUrl });
-  if (documentUrl && documentUrl !== locationUrl) urlCandidates.push({ source: 'document', url: documentUrl });
+  if (documentUrl && documentUrl !== locationUrl)
+    urlCandidates.push({ source: 'document', url: documentUrl });
   if (canonical?.href) urlCandidates.push({ source: 'canonical', url: canonical.href });
   if (og?.content) urlCandidates.push({ source: 'og', url: og.content });
 
   for (const candidate of urlCandidates) {
-      const parsed = captureBookmarkRouteFromUrl(candidate.url);
-      if (parsed?.folderId) {
+    const parsed = captureBookmarkRouteFromUrl(candidate.url);
+    if (parsed?.folderId) {
       return { ...parsed, source: candidate.source, confidence: 30 };
-      }
     }
+  }
 
   const firstCandidate = urlCandidates[0];
   if (!firstCandidate) return null;
@@ -1492,33 +1524,33 @@ function setBookmarkContext(value: unknown): void {
   }
   try {
     // The same value needs to be visible from both content and page realms.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (hookGlobalObject as any)[BOOKMARK_CONTEXT_KEY] = payload;
+    (hookGlobalObject as Record<string, unknown>)[BOOKMARK_CONTEXT_KEY] = payload;
   } catch {
     // ignore
   }
   try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (window as any)[BOOKMARK_CONTEXT_KEY] = payload;
+    (window as unknown as Record<string, unknown>)[BOOKMARK_CONTEXT_KEY] = payload;
   } catch {
     // ignore
   }
   try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any)[BOOKMARK_CONTEXT_KEY] = payload;
+    (globalThis as Record<string, unknown>)[BOOKMARK_CONTEXT_KEY] = payload;
   } catch {
     // ignore
   }
 }
 
-function defineOn(target: object, name: string, fn: Function): boolean {
+function defineOn(target: object, name: string, fn: unknown): boolean {
   try {
+    if (typeof fn !== 'function') {
+      return false;
+    }
+    const hookFn = fn as HookCallable;
     if (exportFunctionMaybe) {
-      exportFunctionMaybe(fn, target, { defineAs: name });
+      exportFunctionMaybe(hookFn, target, { defineAs: name });
       return true;
     }
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (target as any)[name] = fn;
+    (target as Record<string, unknown>)[name] = hookFn;
     return true;
   } catch (err) {
     logger.error(`Failed to define ${name} hook`, err);
@@ -1528,10 +1560,7 @@ function defineOn(target: object, name: string, fn: Function): boolean {
 
 function getFunctionFromHookState(
   candidate: unknown,
-  marker:
-    | '__twe_is_hook_open_v1'
-    | '__twe_is_hook_send_v1'
-    | '__twe_is_hook_fetch_v1',
+  marker: '__twe_is_hook_open_v1' | '__twe_is_hook_send_v1' | '__twe_is_hook_fetch_v1',
   originalKey: string,
 ): unknown {
   if (!candidate || typeof candidate !== 'function') {
@@ -1580,8 +1609,10 @@ function postHookMessage(payload: unknown): void {
       __twe_msg_revision_v1: HOOK_REVISION,
     };
 
-    const postMessageOnHookGlobal = (hookGlobalObject as Record<string, unknown>)
-      .postMessage as (message: unknown, targetOrigin: string) => void | undefined;
+    const postMessageOnHookGlobal = (hookGlobalObject as Record<string, unknown>).postMessage as (
+      message: unknown,
+      targetOrigin: string,
+    ) => void | undefined;
     postMessageOnHookGlobal?.(payload, messageTargetOrigin);
     return;
   } catch {
@@ -1589,8 +1620,10 @@ function postHookMessage(payload: unknown): void {
   }
 
   try {
-    const postMessageOnGlobalThis = (globalThis as Record<string, unknown>)
-      .postMessage as (message: unknown, targetOrigin: string) => void | undefined;
+    const postMessageOnGlobalThis = (globalThis as Record<string, unknown>).postMessage as (
+      message: unknown,
+      targetOrigin: string,
+    ) => void | undefined;
     postMessageOnGlobalThis?.(payload, messageTargetOrigin);
   } catch {
     // ignore
@@ -1601,8 +1634,7 @@ function postHookMessage(payload: unknown): void {
  * The original XHR method backup.
  */
 const xhrOpen = hookGlobalObject.XMLHttpRequest?.prototype?.open;
-const fetchNative =
-  typeof hookGlobalObject.fetch === 'function' ? hookGlobalObject.fetch : null;
+const fetchNative = typeof hookGlobalObject.fetch === 'function' ? hookGlobalObject.fetch : null;
 
 /**
  * The registry for all extensions.
@@ -1760,24 +1792,31 @@ export class ExtensionManager {
     clearBootstrapErrorMarker();
 
     // A small, safe diagnostics object to make hook health inspectable from the console.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const g = hookGlobalObject as any;
+    const g = hookGlobalObject as Record<string, unknown>;
     let constructorError: BootstrapErrorReport | null = null;
     try {
       if (!g[HOOK_STATS_KEY]) {
         g[HOOK_STATS_KEY] = createHookStats(this.instanceId) as HookStats;
       }
-      if (!g[HOOK_RUNTIME_KEY]?.uninstall || typeof g[HOOK_RUNTIME_KEY].uninstall !== 'function') {
+      const runtimeCandidate = g[HOOK_RUNTIME_KEY];
+      const runtimeObject =
+        runtimeCandidate && typeof runtimeCandidate === 'object'
+          ? (runtimeCandidate as {
+              uninstall?: () => void;
+              rev?: number;
+              __twe_runtime_signature_v1?: string;
+            })
+          : null;
+      if (!runtimeObject?.uninstall || typeof runtimeObject.uninstall !== 'function') {
         g[HOOK_RUNTIME_KEY] = {
           __twe_runtime_signature_v1: HOOK_RUNTIME_SIGNATURE,
           uninstall: () => this.uninstallHooks(),
         };
       } else if (
-        typeof g[HOOK_RUNTIME_KEY].uninstall === 'function' &&
-        (g[HOOK_RUNTIME_KEY].rev !== HOOK_REVISION ||
-          g[HOOK_RUNTIME_KEY].__twe_runtime_signature_v1 !== HOOK_RUNTIME_SIGNATURE)
+        runtimeObject.rev !== HOOK_REVISION ||
+        runtimeObject.__twe_runtime_signature_v1 !== HOOK_RUNTIME_SIGNATURE
       ) {
-        g[HOOK_RUNTIME_KEY].uninstall();
+        runtimeObject.uninstall();
       }
 
       if (g[HOOK_STATS_KEY]) {
@@ -1789,11 +1828,14 @@ export class ExtensionManager {
         if (typeof existing.loggedUrls !== 'number') existing.loggedUrls = 0;
         if (typeof existing.messagesTotal !== 'number') existing.messagesTotal = 0;
         if (typeof existing.messagesLegacyShape !== 'number') existing.messagesLegacyShape = 0;
-        if (typeof existing.messagesMissingContext !== 'number') existing.messagesMissingContext = 0;
-        if (typeof existing.messagesRepairedAtBridge !== 'number') existing.messagesRepairedAtBridge = 0;
+        if (typeof existing.messagesMissingContext !== 'number')
+          existing.messagesMissingContext = 0;
+        if (typeof existing.messagesRepairedAtBridge !== 'number')
+          existing.messagesRepairedAtBridge = 0;
         if (typeof existing.messagesMissingBody !== 'number') existing.messagesMissingBody = 0;
         if (typeof existing.responsesProcessed !== 'number') existing.responsesProcessed = 0;
-        if (typeof existing.responsesSkippedDuplicate !== 'number') existing.responsesSkippedDuplicate = 0;
+        if (typeof existing.responsesSkippedDuplicate !== 'number')
+          existing.responsesSkippedDuplicate = 0;
         if (typeof existing.lastMessageAt !== 'number') existing.lastMessageAt = 0;
         existing.activeInstanceId = this.instanceId;
         existing.rev = HOOK_REVISION;
@@ -1831,12 +1873,19 @@ export class ExtensionManager {
       };
       publishHookGlobals(this.hookStats, g[HOOK_RUNTIME_KEY] as Record<string, unknown>);
     } catch (error) {
-      constructorError = recordBootstrapError('ExtensionManager.constructor', this.instanceId, error);
+      constructorError = recordBootstrapError(
+        'ExtensionManager.constructor',
+        this.instanceId,
+        error,
+      );
       logger.error('ExtensionManager constructor bootstrap error', error);
     }
 
     try {
-      const fallbackStats = normalizeRuntimeForRead(this.hookStats, createHookStats(this.instanceId));
+      const fallbackStats = normalizeRuntimeForRead(
+        this.hookStats,
+        createHookStats(this.instanceId),
+      );
       if (!this.hookStats || this.hookStats.activeInstanceId !== this.instanceId) {
         this.hookStats = fallbackStats;
       }
@@ -1908,8 +1957,9 @@ export class ExtensionManager {
     const now = Date.now();
     const currentRoute = typeof location !== 'undefined' ? location.href : '';
     const routeIsBookmarks = isBookmarksRoute(currentRoute);
-    const candidateIsBookmarks =
-      candidate?.pageUrl ? isBookmarksRoute(candidate.pageUrl) : routeIsBookmarks;
+    const candidateIsBookmarks = candidate?.pageUrl
+      ? isBookmarksRoute(candidate.pageUrl)
+      : routeIsBookmarks;
 
     if (!candidate) {
       if (routeIsBookmarks && this.lastStickyBookmarkContext?.folderId) {
@@ -1974,7 +2024,12 @@ export class ExtensionManager {
       return;
     }
 
-    if (!candidate.folderId && routeIsBookmarks && lastSticky?.folderId && now - lastSticky.capturedAt <= BOOKMARK_CONTEXT_BOOKMARKS_ONLY_STALE_MS) {
+    if (
+      !candidate.folderId &&
+      routeIsBookmarks &&
+      lastSticky?.folderId &&
+      now - lastSticky.capturedAt <= BOOKMARK_CONTEXT_BOOKMARKS_ONLY_STALE_MS
+    ) {
       setBookmarkContext({
         folderId: lastSticky.folderId,
         pageUrl: candidate.pageUrl,
@@ -2025,17 +2080,24 @@ export class ExtensionManager {
     };
 
     const wrap = (name: 'pushState' | 'replaceState') => {
-      const anyHistory = historyObj as unknown as Record<string, unknown>;
-      const original = anyHistory[name];
-      if (typeof original !== 'function' || (original as any).__twe_is_bookmark_context_patched_v1) return;
+      type PatchedNavigationHook = HookCallable & {
+        __twe_is_bookmark_context_patched_v1?: boolean;
+      };
+      const mutableHistory = historyObj as unknown as Record<string, unknown>;
+      const original = mutableHistory[name];
+      if (
+        typeof original !== 'function' ||
+        (original as PatchedNavigationHook).__twe_is_bookmark_context_patched_v1
+      )
+        return;
 
       const wrapped = function (this: History, ...args: unknown[]) {
         const result = (original as (...a: unknown[]) => unknown).apply(this, args);
         captureFromNavigation(args);
         return result;
       };
-      (wrapped as any).__twe_is_bookmark_context_patched_v1 = true;
-      anyHistory[name] = wrapped;
+      (wrapped as PatchedNavigationHook).__twe_is_bookmark_context_patched_v1 = true;
+      mutableHistory[name] = wrapped;
     };
 
     wrap('pushState');
@@ -2047,55 +2109,53 @@ export class ExtensionManager {
       hookGlobalObject.addEventListener?.('hashchange', refreshContext);
     }
 
-    const anyHistory = historyObj as unknown as {
-      back?: (...args: unknown[]) => unknown;
-      go?: (...args: unknown[]) => unknown;
-      forward?: (...args: unknown[]) => unknown;
-    };
-      const locationObj = (hookGlobalObject as unknown as { location?: Location }).location;
-      if (locationObj) {
-        const locationAny = locationObj as unknown as {
-          assign?: (url: string | URL) => void;
-          replace?: (url: string | URL) => void;
-        };
+    const locationObj = (hookGlobalObject as unknown as { location?: Location }).location;
+    if (locationObj) {
+      const locationAny = locationObj as unknown as {
+        assign?: (url: string | URL) => void;
+        replace?: (url: string | URL) => void;
+      };
 
-        const wrapLocation = (
-          methodName: 'assign' | 'replace',
-        ): void => {
-          const original = locationAny[methodName];
-          if (typeof original !== 'function') return;
-          if ((original as { __twe_is_bookmark_context_patched_v1?: boolean }).__twe_is_bookmark_context_patched_v1) {
-            return;
-          }
-          const wrapped = function (url: string | URL): void {
-            const value = typeof url === 'string' ? url : url.toString();
-            try {
-              original.call(locationObj as Location, value);
-            } catch {
-              // Some pages lock location methods; avoid crashing the script.
-            }
-            refreshContext();
-          };
-          (wrapped as { __twe_is_bookmark_context_patched_v1?: boolean }).__twe_is_bookmark_context_patched_v1 = true;
+      const wrapLocation = (methodName: 'assign' | 'replace'): void => {
+        const original = locationAny[methodName];
+        if (typeof original !== 'function') return;
+        if (
+          (original as { __twe_is_bookmark_context_patched_v1?: boolean })
+            .__twe_is_bookmark_context_patched_v1
+        ) {
+          return;
+        }
+        const wrapped = function (url: string | URL): void {
+          const value = typeof url === 'string' ? url : url.toString();
           try {
-            locationAny[methodName] = wrapped;
+            original.call(locationObj as Location, value);
           } catch {
-            try {
-              if (typeof Object.defineProperty === 'function') {
-                Object.defineProperty(locationAny, methodName, {
-                  value: wrapped,
-                  configurable: true,
-                  writable: true,
-                });
-              }
-            } catch {
-              // ignore
-            }
+            // Some pages lock location methods; avoid crashing the script.
           }
+          refreshContext();
         };
-        wrapLocation('assign');
-        wrapLocation('replace');
-      }
+        (
+          wrapped as { __twe_is_bookmark_context_patched_v1?: boolean }
+        ).__twe_is_bookmark_context_patched_v1 = true;
+        try {
+          locationAny[methodName] = wrapped;
+        } catch {
+          try {
+            if (typeof Object.defineProperty === 'function') {
+              Object.defineProperty(locationAny, methodName, {
+                value: wrapped,
+                configurable: true,
+                writable: true,
+              });
+            }
+          } catch {
+            // ignore
+          }
+        }
+      };
+      wrapLocation('assign');
+      wrapLocation('replace');
+    }
 
     if (!hookGlobalObject.__twe_bookmark_context_bookmark_click_v1 && document?.body) {
       const onClick = (event: Event) => {
@@ -2249,9 +2309,9 @@ export class ExtensionManager {
           typeof bridgeReq.requestId === 'string' && bridgeReq.requestId.trim().length
             ? bridgeReq.requestId
             : typeof (rawEnvelopeRequest as { requestId?: unknown })?.requestId === 'string' &&
-              (rawEnvelopeRequest as { requestId?: string }).requestId?.trim().length
-            ? (rawEnvelopeRequest as { requestId: string }).requestId
-            : nextBookmarkRequestId();
+                (rawEnvelopeRequest as { requestId?: string }).requestId?.trim().length
+              ? (rawEnvelopeRequest as { requestId: string }).requestId
+              : nextBookmarkRequestId();
         const incomingMethod =
           typeof bridgeReq.method === 'string' && bridgeReq.method
             ? bridgeReq.method
@@ -2273,40 +2333,41 @@ export class ExtensionManager {
               : undefined;
 
         const requestContextFromLegacyWrapper = rawEnvelopeRequest
-          ? ((rawEnvelopeRequest as Record<string, { bookmarkContext?: unknown }>) as { bookmarkContext?: unknown }).bookmarkContext
+          ? (
+              rawEnvelopeRequest as Record<string, { bookmarkContext?: unknown }> as {
+                bookmarkContext?: unknown;
+              }
+            ).bookmarkContext
           : undefined;
         const requestContextFromAlternative =
-          rawEnvelopeRequest && Object.prototype.hasOwnProperty.call(rawEnvelopeRequest, 'requestContext')
+          rawEnvelopeRequest &&
+          Object.prototype.hasOwnProperty.call(rawEnvelopeRequest, 'requestContext')
             ? (rawEnvelopeRequest as Record<string, unknown>).requestContext
             : undefined;
         const hasRequestContext =
-          (requestContextFromLegacyWrapper !== undefined && requestContextFromLegacyWrapper !== null) ||
+          (requestContextFromLegacyWrapper !== undefined &&
+            requestContextFromLegacyWrapper !== null) ||
           (requestContextFromAlternative !== undefined && requestContextFromAlternative !== null) ||
           bridgeReq.bookmarkContext !== undefined;
         const hasBodyField =
-          typeof bridgeReq.body === 'string'
-          || typeof (rawEnvelopeRequest as { body?: unknown })?.body === 'string';
+          typeof bridgeReq.body === 'string' ||
+          typeof (rawEnvelopeRequest as { body?: unknown })?.body === 'string';
         const hasRequestIdField =
-          (typeof bridgeReq.requestId === 'string' && bridgeReq.requestId.trim().length > 0)
-          || (
-            typeof (rawEnvelopeRequest as { requestId?: unknown })?.requestId === 'string'
-            && ((rawEnvelopeRequest as { requestId?: string }).requestId?.trim().length || 0) > 0
-          );
+          (typeof bridgeReq.requestId === 'string' && bridgeReq.requestId.trim().length > 0) ||
+          (typeof (rawEnvelopeRequest as { requestId?: unknown })?.requestId === 'string' &&
+            ((rawEnvelopeRequest as { requestId?: string }).requestId?.trim().length || 0) > 0);
         const req = buildNormalizedHookMessageRequest({
           method: incomingMethod,
           url: incomingUrl,
           body: incomingBody,
           bookmarkContext:
-            bridgeReq.bookmarkContext
-            ?? requestContextFromLegacyWrapper
-            ?? requestContextFromAlternative,
+            bridgeReq.bookmarkContext ??
+            requestContextFromLegacyWrapper ??
+            requestContextFromAlternative,
           requestId,
         });
         const bridgeRepaired =
-          isLegacyMessage
-          || !hasRequestContext
-          || !hasBodyField
-          || !hasRequestIdField;
+          isLegacyMessage || !hasRequestContext || !hasBodyField || !hasRequestIdField;
         const isBookmarksMessage = isBookmarksApiRequest(req.url);
         const endpointKey = isBookmarksMessage ? extractBookmarksEndpoint(req.url) : null;
         const endpointStats = endpointKey ? this.getEndpointStats(endpointKey) : null;
@@ -2406,7 +2467,11 @@ export class ExtensionManager {
 
           if (this.debugEnabled && this.hookStats.loggedUrls < 5) {
             this.hookStats.loggedUrls++;
-            logger.debug('Hook saw request', { method: req.method, url: req.url, status: res.status });
+            logger.debug('Hook saw request', {
+              method: req.method,
+              url: req.url,
+              status: res.status,
+            });
           }
           this.syncRuntimeStats();
         }
@@ -2432,13 +2497,16 @@ export class ExtensionManager {
   private installHttpHooks(force = false) {
     let hookInstalled = false;
     try {
-      if (!hookGlobalObject.XMLHttpRequest?.prototype || !hookGlobalObject.XMLHttpRequest?.prototype?.open) {
+      if (
+        !hookGlobalObject.XMLHttpRequest?.prototype ||
+        !hookGlobalObject.XMLHttpRequest?.prototype?.open
+      ) {
         throw new Error('XMLHttpRequest.prototype.open not available');
       }
 
       // Stash originals in page-realm so wrappers can call through safely.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const proto = hookGlobalObject.XMLHttpRequest.prototype as Record<string, unknown>;
+
+      const proto = hookGlobalObject.XMLHttpRequest.prototype as unknown as Record<string, unknown>;
       const currentOpen = proto.open;
       const currentSend = proto.send;
       if (!proto[ORIG_XHR_OPEN_KEY] && typeof currentOpen === 'function') {
@@ -2463,18 +2531,19 @@ export class ExtensionManager {
         throw new Error('XMLHttpRequest.prototype.send not available');
       }
 
-      const sendNeedsRepair =
-        force || !hasHookVersion(currentSend, '__twe_is_hook_send_v1');
+      const sendNeedsRepair = force || !hasHookVersion(currentSend, '__twe_is_hook_send_v1');
       if (sendNeedsRepair) {
-      const sendWrapper = function (
+        const sendWrapper = function (
           this: XMLHttpRequest,
           body?: Document | XMLHttpRequestBodyInit | null,
         ): void {
           try {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const xhr = this as any;
+            const xhr = this as HookedXhr;
             const reqMethod = String(xhr.__twe_req_method_v1 || 'GET');
-            const requestId = typeof xhr.__twe_req_id_v1 === 'string' ? xhr.__twe_req_id_v1 : nextBookmarkRequestId();
+            const requestId =
+              typeof xhr.__twe_req_id_v1 === 'string'
+                ? xhr.__twe_req_id_v1
+                : nextBookmarkRequestId();
             xhr.__twe_req_id_v1 = requestId;
             xhr.__twe_req_body_v1 = serializeRequestBodyText(body as unknown);
             if (typeof body === 'undefined') {
@@ -2503,7 +2572,7 @@ export class ExtensionManager {
         };
         markHookFunction(sendWrapper, '__twe_is_hook_send_v1');
         defineOn(proto, 'send', sendWrapper);
-        markHookFunction((proto as { send?: Function }).send as Function, '__twe_is_hook_send_v1');
+        markHookFunction((proto as { send?: unknown }).send, '__twe_is_hook_send_v1');
         hookInstalled = true;
       } else {
         hookInstalled = true;
@@ -2516,58 +2585,64 @@ export class ExtensionManager {
       ) {
         hookInstalled = true;
       } else {
-      const wrappedOpenFromState = getFunctionFromHookState(
-        currentOpen,
-        '__twe_is_hook_open_v1',
-        ORIG_XHR_OPEN_KEY,
-      );
-      const openBase =
-        typeof wrappedOpenFromState === 'function'
-          ? (wrappedOpenFromState as XMLHttpRequest['open'])
-          : typeof proto[ORIG_XHR_OPEN_KEY] === 'function'
-            ? (proto[ORIG_XHR_OPEN_KEY] as XMLHttpRequest['open'])
-            : xhrOpen;
+        const wrappedOpenFromState = getFunctionFromHookState(
+          currentOpen,
+          '__twe_is_hook_open_v1',
+          ORIG_XHR_OPEN_KEY,
+        );
+        const openBase =
+          typeof wrappedOpenFromState === 'function'
+            ? (wrappedOpenFromState as XMLHttpRequest['open'])
+            : typeof proto[ORIG_XHR_OPEN_KEY] === 'function'
+              ? (proto[ORIG_XHR_OPEN_KEY] as XMLHttpRequest['open'])
+              : xhrOpen;
 
-      if (typeof openBase !== 'function') {
-        throw new Error('XMLHttpRequest.prototype.open base function unavailable');
-      }
+        if (typeof openBase !== 'function') {
+          throw new Error('XMLHttpRequest.prototype.open base function unavailable');
+        }
 
-      const openWrapper = function (this: XMLHttpRequest, ...args: unknown[]): unknown {
-        try {
-          const method = typeof args[0] === 'string' ? args[0] : String(args[0] ?? '');
-          const rawUrl = args[1];
-          const nextUrl = typeof rawUrl === 'string' ? rawUrl : String(rawUrl ?? '');
+        const openWrapper = function (this: XMLHttpRequest, ...args: unknown[]): unknown {
+          try {
+            const method = typeof args[0] === 'string' ? args[0] : String(args[0] ?? '');
+            const rawUrl = args[1];
+            const nextUrl = typeof rawUrl === 'string' ? rawUrl : String(rawUrl ?? '');
 
-          // Keep this wrapper completely page-realm safe:
-          // do not touch content-realm objects (logger/manager/etc), and never throw.
+            // Keep this wrapper completely page-realm safe:
+            // do not touch content-realm objects (logger/manager/etc), and never throw.
             if (nextUrl && /\/graphql\/|\/api\/1\.1\//.test(nextUrl)) {
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              const self = this as any;
+              const self = this as HookedXhr;
               self.__twe_req_method_v1 = method;
               self.__twe_req_url_v1 = nextUrl;
               self.__twe_req_body_v1 = '';
               self.__twe_req_id_v1 = nextBookmarkRequestId();
-              self.__twe_req_bookmark_context_v1 = resolveRequestBookmarkContext(nextUrl, undefined, {
-                method,
-                url: nextUrl,
-                requestId: self.__twe_req_id_v1,
-              });
+              self.__twe_req_bookmark_context_v1 = resolveRequestBookmarkContext(
+                nextUrl,
+                undefined,
+                {
+                  method,
+                  url: nextUrl,
+                  requestId: self.__twe_req_id_v1,
+                },
+              );
               setBookmarkContext(self.__twe_req_bookmark_context_v1);
               if (!self.__twe_hooked_v1) {
                 self.__twe_hooked_v1 = true;
                 this.addEventListener('load', function (this: XMLHttpRequest) {
                   try {
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    const xhr = this as any;
+                    const xhr = this as HookedXhr;
                     const reqMethod = xhr.__twe_req_method_v1 || method;
                     const reqUrl = xhr.__twe_req_url_v1 || nextUrl;
                     if (!reqUrl || !/\/graphql\/|\/api\/1\.1\//.test(reqUrl)) return;
                     const responseText = String((this as XMLHttpRequest).responseText ?? '');
                     const reqBody = xhr.__twe_req_body_v1;
-                    const reqId = typeof xhr.__twe_req_id_v1 === 'string' ? xhr.__twe_req_id_v1 : nextBookmarkRequestId();
+                    const reqId =
+                      typeof xhr.__twe_req_id_v1 === 'string'
+                        ? xhr.__twe_req_id_v1
+                        : nextBookmarkRequestId();
                     xhr.__twe_req_id_v1 = reqId;
-                    const reqContext = xhr.__twe_req_bookmark_context_v1
-                      || resolveRequestBookmarkContext(reqUrl, reqBody, {
+                    const reqContext =
+                      xhr.__twe_req_bookmark_context_v1 ||
+                      resolveRequestBookmarkContext(reqUrl, reqBody, {
                         method: reqMethod,
                         url: reqUrl,
                         body: reqBody,
@@ -2589,26 +2664,26 @@ export class ExtensionManager {
                       req: normalizedReq,
                       res: { status: (this as XMLHttpRequest).status ?? 0, responseText },
                     });
-                } catch {
-                  // Never throw from XHR hooks; it can break the feed.
-                }
-              });
+                  } catch {
+                    // Never throw from XHR hooks; it can break the feed.
+                  }
+                });
+              }
             }
+          } catch {
+            // Never throw from XHR hooks; it can break the feed.
           }
-        } catch {
-          // Never throw from XHR hooks; it can break the feed.
+
+          return (openBase as typeof openWrapper).apply(this, args as never);
+        };
+        markHookFunction(openWrapper, '__twe_is_hook_open_v1');
+        proto[ORIG_XHR_OPEN_KEY] = openBase;
+        proto[ORIG_XHR_SEND_KEY] = sendBase;
+        if (defineOn(proto, 'open', openWrapper)) {
+          hookInstalled = true;
         }
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        return (openBase as typeof openWrapper).apply(this, args as never);
-      };
-      markHookFunction(openWrapper, '__twe_is_hook_open_v1');
-      proto[ORIG_XHR_OPEN_KEY] = openBase;
-      proto[ORIG_XHR_SEND_KEY] = sendBase;
-      if (defineOn(proto, 'open', openWrapper)) {
-        hookInstalled = true;
-      }
-      markHookFunction((proto as { open?: Function }).open as Function, '__twe_is_hook_open_v1');
-      markHookFunction((proto as { send?: Function }).send as Function, '__twe_is_hook_send_v1');
+        markHookFunction((proto as { open?: unknown }).open, '__twe_is_hook_open_v1');
+        markHookFunction((proto as { send?: unknown }).send, '__twe_is_hook_send_v1');
       }
     } catch (err) {
       logger.error('Failed to hook into XMLHttpRequest', err);
@@ -2625,9 +2700,9 @@ export class ExtensionManager {
       try {
         const hasUnsafe = !!unsafe;
         const hasWrapped = !!pageWindow;
-      const hasExport = !!exportFunctionMaybe;
-      const openIsPatched = hookGlobalObject.XMLHttpRequest?.prototype?.open !== xhrOpen;
-      if (!openIsPatched) {
+        const hasExport = !!exportFunctionMaybe;
+        const openIsPatched = hookGlobalObject.XMLHttpRequest?.prototype?.open !== xhrOpen;
+        if (!openIsPatched) {
           logger.error(
             `XHR hook not active (unsafeWindow=${hasUnsafe}, wrappedJSObject=${hasWrapped}, exportFunction=${hasExport}). ` +
               `Bookmark capture will not work.`,
@@ -2651,7 +2726,6 @@ export class ExtensionManager {
       return;
     }
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const existingFetch = (hookGlobalObject as Record<string, unknown>).fetch;
     if (!force && hasHookVersion(existingFetch, '__twe_is_hook_fetch_v1')) {
       logger.debug('Fetch hook already installed');
@@ -2689,8 +2763,8 @@ export class ExtensionManager {
           : typeof URL !== 'undefined' && input instanceof URL
             ? input.toString()
             : typeof Request !== 'undefined' && input instanceof Request
-            ? input.url
-            : '';
+              ? input.url
+              : '';
       const serializedBody = serializeRequestBodyText(init?.body);
       const requestId = nextBookmarkRequestId();
       const requestContext = resolveRequestBookmarkContext(url, serializedBody, {
@@ -2703,8 +2777,10 @@ export class ExtensionManager {
 
       const origFetch = pageAny[ORIG_FETCH_KEY];
       // Use call() to avoid illegal invocation issues.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const response = await (origFetch as any).call(globalThis, input, init);
+      if (typeof origFetch !== 'function') {
+        throw new Error('fetch base function unavailable');
+      }
+      const response = await (origFetch as typeof fetch).call(globalThis, input, init);
 
       if (!url || !/\/graphql\/|\/api\/1\.1\//.test(url)) return response;
 
@@ -2717,25 +2793,25 @@ export class ExtensionManager {
       }
 
       // Read response body from a clone to avoid consuming the original stream.
-        void response
+      void response
         .clone()
         .text()
         .then((responseText: string) => {
           if (!responseText) return;
-              try {
-                const normalizedReq = buildNormalizedHookMessageRequest({
-                  method,
-                  url,
-                  body: serializedBody || '',
-                  bookmarkContext: requestContext ?? null,
-                  requestId,
-                });
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                postHookMessage({
-                  __twe_mcp_hook_v1: true,
-                  req: normalizedReq,
-                  res: { status: response.status, responseText },
-                });
+          try {
+            const normalizedReq = buildNormalizedHookMessageRequest({
+              method,
+              url,
+              body: serializedBody || '',
+              bookmarkContext: requestContext ?? null,
+              requestId,
+            });
+
+            postHookMessage({
+              __twe_mcp_hook_v1: true,
+              req: normalizedReq,
+              res: { status: response.status, responseText },
+            });
           } catch {
             // ignore
           }
@@ -2749,7 +2825,7 @@ export class ExtensionManager {
     markHookFunction(fetchWrapper, '__twe_is_hook_fetch_v1');
 
     const ok = defineOn(pageAny as object, 'fetch', fetchWrapper);
-    markHookFunction((pageAny as { fetch?: Function }).fetch as Function, '__twe_is_hook_fetch_v1');
+    markHookFunction((pageAny as { fetch?: unknown }).fetch, '__twe_is_hook_fetch_v1');
     if (ok && this.debugEnabled) {
       logger.info('Hooked into fetch');
     }
@@ -2793,5 +2869,4 @@ export class ExtensionManager {
         }
       });
   }
-
 }

@@ -358,7 +358,11 @@ export const columns = [
     header: () => <span>Bookmark Folder ID</span>,
     cell: (info) => {
       const val = info.getValue();
-      return val ? <p class="w-32 break-all font-mono text-xs">{val}</p> : <p class="text-gray-400">—</p>;
+      return val ? (
+        <p class="w-32 break-all font-mono text-xs">{val}</p>
+      ) : (
+        <p class="text-gray-400">—</p>
+      );
     },
   }),
   columnHelper.display({

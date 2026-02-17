@@ -42,20 +42,20 @@ if (isExtensionManagerLike(existing)) {
 } else {
   if (existing && typeof existing === 'object') {
     try {
-    const oldManager = existing as {
-      dispose?: () => void;
-      uninstallHooks?: () => void;
-      uninstall?: () => void;
-    };
-    if (typeof oldManager.dispose === 'function') {
-      oldManager.dispose();
-    }
-    if (typeof oldManager.uninstallHooks === 'function') {
-      oldManager.uninstallHooks();
-    }
-    if (typeof oldManager.uninstall === 'function') {
-      oldManager.uninstall();
-    }
+      const oldManager = existing as {
+        dispose?: () => void;
+        uninstallHooks?: () => void;
+        uninstall?: () => void;
+      };
+      if (typeof oldManager.dispose === 'function') {
+        oldManager.dispose();
+      }
+      if (typeof oldManager.uninstallHooks === 'function') {
+        oldManager.uninstallHooks();
+      }
+      if (typeof oldManager.uninstall === 'function') {
+        oldManager.uninstall();
+      }
     } catch {
       // ignore
     }
