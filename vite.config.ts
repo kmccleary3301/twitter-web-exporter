@@ -84,7 +84,7 @@ export default defineConfig({
         // when monkeypatching fetch/XHR ("Permission denied to access property length").
         // Violentmonkey can inject into page using extension mechanisms; if CSP blocks in
         // some environments, we can re-introduce a content fallback.
-        'inject-into': 'page',
+        'inject-into': isE2EBuild ? 'content' : 'page',
         updateURL:
           'https://github.com/prinsss/twitter-web-exporter/releases/latest/download/twitter-web-exporter.user.js',
         downloadURL:

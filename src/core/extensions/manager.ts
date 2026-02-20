@@ -7,16 +7,54 @@ import { Extension, ExtensionConstructor } from './extension';
 /**
  * Global object reference. In some cases, the `unsafeWindow` is not available.
  */
-const unsafe = unsafeWindow ?? null;
-// In Firefox (WebExtension content scripts), page objects are often Xray-wrapped.
-// Prefer `wrappedJSObject` to access the real page realm.
-const unsafeObject = unsafe as { wrappedJSObject?: unknown } | null;
-const pageWindow =
-  unsafeObject && unsafeObject.wrappedJSObject && typeof unsafeObject.wrappedJSObject === 'object'
-    ? (unsafeObject.wrappedJSObject as Window & typeof globalThis)
-    : null;
 type HookGlobal = Window & typeof globalThis & Record<string, unknown>;
-const hookGlobalObject = (pageWindow ?? unsafe ?? window ?? globalThis) as unknown as HookGlobal;
+
+function getUnsafeWindowCandidate(): unknown {
+  try {
+    return unsafeWindow ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function getWrappedPageWindowCandidate(unsafeCandidate: unknown): HookGlobal | null {
+  try {
+    const unsafeObject = unsafeCandidate as { wrappedJSObject?: unknown } | null;
+    if (!unsafeObject?.wrappedJSObject || typeof unsafeObject.wrappedJSObject !== 'object') {
+      return null;
+    }
+    return unsafeObject.wrappedJSObject as HookGlobal;
+  } catch {
+    return null;
+  }
+}
+
+let cachedHookGlobalObject: HookGlobal | null = null;
+function getHookGlobalObject(): HookGlobal {
+  if (cachedHookGlobalObject) {
+    return cachedHookGlobalObject;
+  }
+  const unsafeCandidate = getUnsafeWindowCandidate();
+  const wrappedCandidate = getWrappedPageWindowCandidate(unsafeCandidate);
+  const windowCandidate = typeof window !== 'undefined' ? (window as unknown as HookGlobal) : null;
+  const globalCandidate = globalThis as HookGlobal;
+  cachedHookGlobalObject = (wrappedCandidate ??
+    (unsafeCandidate as HookGlobal | null) ??
+    windowCandidate ??
+    globalCandidate) as HookGlobal;
+  return cachedHookGlobalObject;
+}
+
+const hookGlobalObject = new Proxy({} as HookGlobal, {
+  get(_target, prop) {
+    const globalObject = getHookGlobalObject();
+    return Reflect.get(globalObject, prop, globalObject);
+  },
+  set(_target, prop, value) {
+    const globalObject = getHookGlobalObject();
+    return Reflect.set(globalObject, prop, value, globalObject);
+  },
+});
 
 type HookCallable = (...args: unknown[]) => unknown;
 type ExportFunction = (
@@ -25,8 +63,15 @@ type ExportFunction = (
   options?: { defineAs?: string },
 ) => unknown;
 // Firefox-only: `exportFunction` makes functions callable from the page realm.
-const exportFunctionMaybe = (globalThis as unknown as { exportFunction?: unknown })
-  .exportFunction as ExportFunction | undefined;
+function getExportFunctionMaybe(): ExportFunction | undefined {
+  try {
+    return (globalThis as unknown as { exportFunction?: unknown }).exportFunction as
+      | ExportFunction
+      | undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 const HOOK_MESSAGE_FLAG = '__twe_mcp_hook_v1';
 const ORIG_XHR_OPEN_KEY = '__twe_orig_xhr_open_v1';
@@ -34,6 +79,7 @@ const ORIG_XHR_SEND_KEY = '__twe_orig_xhr_send_v1';
 const ORIG_FETCH_KEY = '__twe_orig_fetch_v1';
 const HOOK_RUNTIME_KEY = '__twe_runtime_v1';
 const HOOK_STATS_KEY = '__twe_hook_stats_v1';
+const RUNTIME_MODES_KEY = '__twe_runtime_modes_v1';
 const BOOKMARK_CONTEXT_KEY = '__twe_bookmark_context_v1';
 const BOOKMARK_CONTEXT_DUMP_KEY = '__twe_bookmark_context_dump_v1';
 const HOOK_BOOTSTRAP_ERROR_KEY = '__twe_bootstrap_error_v1';
@@ -48,6 +94,8 @@ const HOOK_REVISION = 3;
 const EXTENSION_MANAGER_SIGNATURE = 'twitter-web-exporter-extension-manager-v1';
 const EXTENSION_MANAGER_REVISION = 3;
 const HOOK_REPAIR_INTERVAL_MS = 1100;
+const HOOK_REPAIR_BACKOFF_MAX_MS = 60000;
+const HOOK_REPAIR_FAILURE_LIMIT = 5;
 const RESPONSE_DEDUPE_WINDOW_MS = 2600;
 const RESPONSE_DEDUPE_MAX_ENTRIES = 500;
 const RESPONSE_DEDUPE_CLEANUP_COUNT = 120;
@@ -87,6 +135,86 @@ type HookStats = {
 };
 
 type RecentSig = { sig: string; at: number };
+
+type HookMode = 'both' | 'xhr' | 'fetch' | 'off';
+type RepairMode = 'watchdog' | 'off';
+type RuntimeModes = {
+  safeMode: boolean;
+  hookMode: HookMode;
+  repairMode: RepairMode;
+};
+
+const LOCAL_STORAGE_SAFE_MODE_KEY = 'twe_safe_mode_v1';
+const LOCAL_STORAGE_HOOK_MODE_KEY = 'twe_hook_mode_v1';
+const LOCAL_STORAGE_REPAIR_MODE_KEY = 'twe_repair_mode_v1';
+
+function normalizeHookMode(value: unknown): HookMode {
+  return value === 'xhr' || value === 'fetch' || value === 'off' ? value : 'both';
+}
+
+function normalizeRepairMode(value: unknown): RepairMode {
+  return value === 'off' ? 'off' : 'watchdog';
+}
+
+function readLocalStorageValue(key: string): string | null {
+  try {
+    if (typeof localStorage === 'undefined') return null;
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeLocalStorageValue(key: string, value: string): void {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    localStorage.setItem(key, value);
+  } catch {
+    // ignore
+  }
+}
+
+function resolveRuntimeModes(): RuntimeModes {
+  const optionSafeMode = !!options.get('safeMode', false);
+  const optionHookMode = normalizeHookMode(options.get('hookMode', 'both'));
+  const optionRepairMode = normalizeRepairMode(options.get('repairMode', 'watchdog'));
+
+  const storageSafeMode = readLocalStorageValue(LOCAL_STORAGE_SAFE_MODE_KEY);
+  const storageHookMode = readLocalStorageValue(LOCAL_STORAGE_HOOK_MODE_KEY);
+  const storageRepairMode = readLocalStorageValue(LOCAL_STORAGE_REPAIR_MODE_KEY);
+
+  const globalModes = (globalThis as Record<string, unknown>)[RUNTIME_MODES_KEY] as
+    | Partial<RuntimeModes>
+    | undefined;
+
+  const safeMode =
+    typeof globalModes?.safeMode === 'boolean'
+      ? globalModes.safeMode
+      : storageSafeMode === '1' || storageSafeMode === 'true'
+        ? true
+        : storageSafeMode === '0' || storageSafeMode === 'false'
+          ? false
+          : optionSafeMode;
+  const hookMode = normalizeHookMode(globalModes?.hookMode ?? storageHookMode ?? optionHookMode);
+  const repairMode = normalizeRepairMode(
+    globalModes?.repairMode ?? storageRepairMode ?? optionRepairMode,
+  );
+
+  return { safeMode, hookMode, repairMode };
+}
+
+function getRuntimeCapabilities(): {
+  hasUnsafeWindow: boolean;
+  hasWrappedJSObject: boolean;
+  hasExportFunction: boolean;
+} {
+  const unsafeCandidate = getUnsafeWindowCandidate();
+  return {
+    hasUnsafeWindow: !!unsafeCandidate,
+    hasWrappedJSObject: !!getWrappedPageWindowCandidate(unsafeCandidate),
+    hasExportFunction: !!getExportFunctionMaybe(),
+  };
+}
 
 function hashText(text: string): string {
   let hash = 2166136261;
@@ -734,32 +862,37 @@ function countUniqueTweetIds(responseText: string): number {
 }
 
 function serializeRequestBodyText(body: unknown): string | undefined {
-  if (!body) return undefined;
+  try {
+    if (!body) return undefined;
 
-  if (typeof body === 'string') {
-    return body;
-  }
-
-  if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
-    return body.toString();
-  }
-
-  if (typeof FormData !== 'undefined' && body instanceof FormData) {
-    try {
-      const entries = [...body.entries()]
-        .map(([name, value]) => `${name}=${String(value).slice(0, 200)}`)
-        .join('&');
-      return entries;
-    } catch {
-      return undefined;
+    if (typeof body === 'string') {
+      return body;
     }
-  }
 
-  if (typeof Blob !== 'undefined' && body instanceof Blob) {
-    return `blob:${body.type || 'application/octet-stream'}:${body.size}`;
-  }
+    if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+      return body.toString();
+    }
 
-  return undefined;
+    if (typeof FormData !== 'undefined' && body instanceof FormData) {
+      try {
+        const entries = [...body.entries()]
+          .map(([name, value]) => `${name}=${String(value).slice(0, 200)}`)
+          .join('&');
+        return entries;
+      } catch {
+        return undefined;
+      }
+    }
+
+    if (typeof Blob !== 'undefined' && body instanceof Blob) {
+      return `blob:${body.type || 'application/octet-stream'}:${body.size}`;
+    }
+
+    return undefined;
+  } catch {
+    // Cross-compartment objects in Firefox can throw on instanceof checks.
+    return undefined;
+  }
 }
 
 function captureBookmarkRouteFromUrl(
@@ -1546,6 +1679,7 @@ function defineOn(target: object, name: string, fn: unknown): boolean {
       return false;
     }
     const hookFn = fn as HookCallable;
+    const exportFunctionMaybe = getExportFunctionMaybe();
     if (exportFunctionMaybe) {
       exportFunctionMaybe(hookFn, target, { defineAs: name });
       return true;
@@ -1630,11 +1764,26 @@ function postHookMessage(payload: unknown): void {
   }
 }
 
-/**
- * The original XHR method backup.
- */
-const xhrOpen = hookGlobalObject.XMLHttpRequest?.prototype?.open;
-const fetchNative = typeof hookGlobalObject.fetch === 'function' ? hookGlobalObject.fetch : null;
+function addEventListenerSafe(
+  target: unknown,
+  type: string,
+  listener: EventListenerOrEventListenerObject,
+  options?: AddEventListenerOptions | boolean,
+): boolean {
+  if (!target || (typeof target !== 'object' && typeof target !== 'function')) {
+    return false;
+  }
+  const addEventListener = (target as { addEventListener?: unknown }).addEventListener;
+  if (typeof addEventListener !== 'function') {
+    return false;
+  }
+  try {
+    addEventListener.call(target, type, listener, options);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * The registry for all extensions.
@@ -1647,7 +1796,11 @@ export class ExtensionManager {
   private hookRuntime: HookStats | null = null;
   private recentResponseSigs: Map<string, RecentSig> = new Map();
   private lastStickyBookmarkContext: BookmarkContextPayload | null = null;
-  private hookRepairInterval: ReturnType<typeof setInterval> | null = null;
+  private hookRepairInterval: ReturnType<typeof setTimeout> | null = null;
+  private hookRepairBackoffMs = HOOK_REPAIR_INTERVAL_MS;
+  private hookRepairFailures = 0;
+  private runtimeModes: RuntimeModes = resolveRuntimeModes();
+  private runtimeModeReason = '';
   private pageMessageHandler: ((event: MessageEvent<unknown>) => void) | null = null;
   private instanceId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   public readonly __twe_extension_manager_signature_v1 = EXTENSION_MANAGER_SIGNATURE;
@@ -1660,6 +1813,103 @@ export class ExtensionManager {
    * Signal for subscribing to extension changes.
    */
   public signal = new Signal(1);
+
+  private isHookModeEnabled(target: 'xhr' | 'fetch'): boolean {
+    if (this.runtimeModes.safeMode) {
+      return false;
+    }
+    if (this.runtimeModes.hookMode === 'off') {
+      return false;
+    }
+    if (this.runtimeModes.hookMode === 'both') {
+      return true;
+    }
+    return this.runtimeModes.hookMode === target;
+  }
+
+  private persistRuntimeModes() {
+    writeLocalStorageValue(LOCAL_STORAGE_SAFE_MODE_KEY, this.runtimeModes.safeMode ? '1' : '0');
+    writeLocalStorageValue(LOCAL_STORAGE_HOOK_MODE_KEY, this.runtimeModes.hookMode);
+    writeLocalStorageValue(LOCAL_STORAGE_REPAIR_MODE_KEY, this.runtimeModes.repairMode);
+    try {
+      options.set('safeMode', this.runtimeModes.safeMode);
+      options.set('hookMode', this.runtimeModes.hookMode);
+      options.set('repairMode', this.runtimeModes.repairMode);
+    } catch {
+      // ignore
+    }
+  }
+
+  private publishRuntimeModes(extra?: Record<string, unknown>) {
+    const payload = {
+      safeMode: this.runtimeModes.safeMode,
+      hookMode: this.runtimeModes.hookMode,
+      repairMode: this.runtimeModes.repairMode,
+      reason: this.runtimeModeReason || undefined,
+      ...extra,
+    };
+    try {
+      (globalThis as Record<string, unknown>)[RUNTIME_MODES_KEY] = payload;
+    } catch {
+      // ignore
+    }
+    try {
+      (hookGlobalObject as Record<string, unknown>)[RUNTIME_MODES_KEY] = payload;
+    } catch {
+      // ignore
+    }
+  }
+
+  private runHookSelfTest(): { ok: boolean; error?: string } {
+    try {
+      if (this.runtimeModes.safeMode || this.runtimeModes.hookMode === 'off') {
+        return { ok: true };
+      }
+      if (this.isHookModeEnabled('xhr')) {
+        const xhrCtor = hookGlobalObject.XMLHttpRequest;
+        if (!xhrCtor?.prototype) {
+          return { ok: false, error: 'XMLHttpRequest.prototype unavailable' };
+        }
+        if (typeof xhrCtor.prototype.open !== 'function') {
+          return { ok: false, error: 'XMLHttpRequest.prototype.open unavailable' };
+        }
+        if (typeof xhrCtor.prototype.send !== 'function') {
+          return { ok: false, error: 'XMLHttpRequest.prototype.send unavailable' };
+        }
+      }
+      if (this.isHookModeEnabled('fetch')) {
+        const fetchCandidate = (hookGlobalObject as Record<string, unknown>).fetch;
+        if (typeof fetchCandidate !== 'function') {
+          return { ok: false, error: 'fetch unavailable' };
+        }
+      }
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  }
+
+  private enableSafeMode(reason: string, error?: unknown) {
+    this.runtimeModes.safeMode = true;
+    this.runtimeModeReason = reason;
+    this.persistRuntimeModes();
+    this.publishRuntimeModes({
+      enabledAt: Date.now(),
+      error: error ? String(error) : undefined,
+    });
+    this.uninstallHooks();
+    if (this.hookRepairInterval !== null) {
+      clearTimeout(this.hookRepairInterval);
+      this.hookRepairInterval = null;
+    }
+    logger.error(`Hook safe mode enabled (${reason})`, error ?? '');
+  }
+
+  private refreshRuntimeModes() {
+    this.runtimeModes = resolveRuntimeModes();
+    this.persistRuntimeModes();
+    this.publishRuntimeModes();
+  }
 
   public dispose(): void {
     if (this.disposed) return;
@@ -1681,7 +1931,7 @@ export class ExtensionManager {
     }
 
     if (this.hookRepairInterval !== null) {
-      clearInterval(this.hookRepairInterval);
+      clearTimeout(this.hookRepairInterval);
       this.hookRepairInterval = null;
     }
 
@@ -1734,7 +1984,7 @@ export class ExtensionManager {
   public uninstallHooks() {
     try {
       if (this.hookRepairInterval !== null) {
-        clearInterval(this.hookRepairInterval);
+        clearTimeout(this.hookRepairInterval);
         this.hookRepairInterval = null;
       }
 
@@ -1764,7 +2014,9 @@ export class ExtensionManager {
       const runtime = g[HOOK_RUNTIME_KEY] as { uninstall?: () => void };
       if (runtime?.uninstall === this.uninstallHooks) {
         delete g[HOOK_RUNTIME_KEY];
-        delete (window as unknown as Record<string, unknown>)[HOOK_RUNTIME_KEY];
+        if (typeof window !== 'undefined') {
+          delete (window as unknown as Record<string, unknown>)[HOOK_RUNTIME_KEY];
+        }
         delete (globalThis as unknown as Record<string, unknown>)[HOOK_RUNTIME_KEY];
       }
     } catch {
@@ -1773,11 +2025,37 @@ export class ExtensionManager {
   }
 
   constructor() {
-    this.installPageMessageBridge();
-    this.installBookmarkContextTracking();
-    this.installHttpHooks();
-    this.installFetchHooks();
-    this.startHookRepairLoop();
+    this.refreshRuntimeModes();
+    try {
+      this.installPageMessageBridge();
+    } catch (err) {
+      this.enableSafeMode('install-page-message-bridge-failed', err);
+    }
+    try {
+      this.installBookmarkContextTracking();
+    } catch (err) {
+      const details =
+        err instanceof Error ? `${err.name}: ${err.message}` : `unknown error: ${String(err)}`;
+      logger.warn(
+        `Bookmark context tracking install failed; continuing without tracker (${details})`,
+      );
+    }
+    try {
+      if (this.isHookModeEnabled('xhr')) {
+        this.installHttpHooks();
+      }
+      if (this.isHookModeEnabled('fetch')) {
+        this.installFetchHooks();
+      }
+      const hookSelfTest = this.runHookSelfTest();
+      if (!hookSelfTest.ok) {
+        this.enableSafeMode('hook-self-test-failed', hookSelfTest.error);
+      } else if (!this.runtimeModes.safeMode && this.runtimeModes.repairMode !== 'off') {
+        this.startHookRepairLoop();
+      }
+    } catch (err) {
+      this.enableSafeMode('hook-install-failed', err);
+    }
     this.disabledExtensions = new Set(options.get('disabledExtensions', []));
 
     // Make manager singleton discoverable in page/context globals for preload cleanup.
@@ -1857,6 +2135,8 @@ export class ExtensionManager {
         __twe_runtime_signature_v1: HOOK_RUNTIME_SIGNATURE,
         revision: HOOK_REVISION,
         installedAt: Date.now(),
+        modes: this.runtimeModes,
+        runtimeModeReason: this.runtimeModeReason,
         hookStats: this.hookStats,
         messagesTotal: this.hookStats.messagesTotal,
         messagesLegacyShape: this.hookStats.messagesLegacyShape,
@@ -1904,6 +2184,8 @@ export class ExtensionManager {
         instanceId: this.instanceId,
         revision: HOOK_REVISION,
         installedAt: Date.now(),
+        modes: this.runtimeModes,
+        runtimeModeReason: this.runtimeModeReason,
         hookStats: this.hookStats,
         messagesTotal: this.hookStats.messagesTotal,
         messagesLegacyShape: this.hookStats.messagesLegacyShape,
@@ -1935,6 +2217,8 @@ export class ExtensionManager {
         __twe_runtime_signature_v1: HOOK_RUNTIME_SIGNATURE,
         revision: HOOK_REVISION,
         installedAt: Date.now(),
+        modes: this.runtimeModes,
+        runtimeModeReason: this.runtimeModeReason,
         hookStats: this.hookStats,
         messagesTotal: this.hookStats.messagesTotal,
         messagesLegacyShape: this.hookStats.messagesLegacyShape,
@@ -2097,7 +2381,19 @@ export class ExtensionManager {
         return result;
       };
       (wrapped as PatchedNavigationHook).__twe_is_bookmark_context_patched_v1 = true;
-      mutableHistory[name] = wrapped;
+      try {
+        mutableHistory[name] = wrapped;
+      } catch {
+        try {
+          Object.defineProperty(mutableHistory, name, {
+            value: wrapped,
+            configurable: true,
+            writable: true,
+          });
+        } catch {
+          // ignore
+        }
+      }
     };
 
     wrap('pushState');
@@ -2105,8 +2401,11 @@ export class ExtensionManager {
 
     if (!hookGlobalObject.__twe_bookmark_context_listeners_v1) {
       hookGlobalObject.__twe_bookmark_context_listeners_v1 = true;
-      hookGlobalObject.addEventListener?.('popstate', refreshContext);
-      hookGlobalObject.addEventListener?.('hashchange', refreshContext);
+      const listenerTargets = [hookGlobalObject, window, globalThis];
+      for (const target of listenerTargets) {
+        addEventListenerSafe(target, 'popstate', refreshContext);
+        addEventListenerSafe(target, 'hashchange', refreshContext);
+      }
     }
 
     const locationObj = (hookGlobalObject as unknown as { location?: Location }).location;
@@ -2170,7 +2469,16 @@ export class ExtensionManager {
         }
       };
       hookGlobalObject.__twe_bookmark_context_bookmark_click_v1 = true;
-      hookGlobalObject.addEventListener?.('click', onClick, { capture: true });
+      const clickTargets = [hookGlobalObject, window, document, globalThis];
+      let clickListenerInstalled = false;
+      for (const target of clickTargets) {
+        clickListenerInstalled =
+          addEventListenerSafe(target, 'click', onClick, { capture: true }) ||
+          clickListenerInstalled;
+      }
+      if (!clickListenerInstalled && document?.body) {
+        addEventListenerSafe(document.body, 'click', onClick, { capture: true });
+      }
       hookGlobalObject.__twe_bookmark_context_bookmark_click_handler_v1 = onClick;
     }
 
@@ -2495,7 +2803,12 @@ export class ExtensionManager {
    * This need to be done before any XHR request is made.
    */
   private installHttpHooks(force = false) {
+    if (!this.isHookModeEnabled('xhr')) {
+      return;
+    }
+
     let hookInstalled = false;
+    let originalOpen: unknown;
     try {
       if (
         !hookGlobalObject.XMLHttpRequest?.prototype ||
@@ -2509,6 +2822,8 @@ export class ExtensionManager {
       const proto = hookGlobalObject.XMLHttpRequest.prototype as unknown as Record<string, unknown>;
       const currentOpen = proto.open;
       const currentSend = proto.send;
+      originalOpen =
+        typeof proto[ORIG_XHR_OPEN_KEY] === 'function' ? proto[ORIG_XHR_OPEN_KEY] : currentOpen;
       if (!proto[ORIG_XHR_OPEN_KEY] && typeof currentOpen === 'function') {
         proto[ORIG_XHR_OPEN_KEY] = currentOpen;
       }
@@ -2556,13 +2871,15 @@ export class ExtensionManager {
                 body: xhr.__twe_req_body_v1,
                 requestId,
               };
-              xhr.__twe_req_bookmark_context_v1 = resolveRequestBookmarkContext(
-                xhr.__twe_req_url_v1,
-                xhr.__twe_req_body_v1,
-                requestMeta,
-              );
-              if (requestMeta.requestId) {
+              if (isBookmarksApiRequest(String(xhr.__twe_req_url_v1))) {
+                xhr.__twe_req_bookmark_context_v1 = resolveRequestBookmarkContext(
+                  xhr.__twe_req_url_v1,
+                  xhr.__twe_req_body_v1,
+                  requestMeta,
+                );
                 setBookmarkContext(xhr.__twe_req_bookmark_context_v1);
+              } else {
+                xhr.__twe_req_bookmark_context_v1 = null;
               }
             }
           } catch {
@@ -2595,7 +2912,7 @@ export class ExtensionManager {
             ? (wrappedOpenFromState as XMLHttpRequest['open'])
             : typeof proto[ORIG_XHR_OPEN_KEY] === 'function'
               ? (proto[ORIG_XHR_OPEN_KEY] as XMLHttpRequest['open'])
-              : xhrOpen;
+              : (currentOpen as XMLHttpRequest['open']);
 
         if (typeof openBase !== 'function') {
           throw new Error('XMLHttpRequest.prototype.open base function unavailable');
@@ -2615,16 +2932,20 @@ export class ExtensionManager {
               self.__twe_req_url_v1 = nextUrl;
               self.__twe_req_body_v1 = '';
               self.__twe_req_id_v1 = nextBookmarkRequestId();
-              self.__twe_req_bookmark_context_v1 = resolveRequestBookmarkContext(
-                nextUrl,
-                undefined,
-                {
-                  method,
-                  url: nextUrl,
-                  requestId: self.__twe_req_id_v1,
-                },
-              );
-              setBookmarkContext(self.__twe_req_bookmark_context_v1);
+              if (isBookmarksApiRequest(nextUrl)) {
+                self.__twe_req_bookmark_context_v1 = resolveRequestBookmarkContext(
+                  nextUrl,
+                  undefined,
+                  {
+                    method,
+                    url: nextUrl,
+                    requestId: self.__twe_req_id_v1,
+                  },
+                );
+                setBookmarkContext(self.__twe_req_bookmark_context_v1);
+              } else {
+                self.__twe_req_bookmark_context_v1 = null;
+              }
               if (!self.__twe_hooked_v1) {
                 self.__twe_hooked_v1 = true;
                 this.addEventListener('load', function (this: XMLHttpRequest) {
@@ -2640,18 +2961,23 @@ export class ExtensionManager {
                         ? xhr.__twe_req_id_v1
                         : nextBookmarkRequestId();
                     xhr.__twe_req_id_v1 = reqId;
+                    const bookmarkRequest = isBookmarksApiRequest(reqUrl);
                     const reqContext =
                       xhr.__twe_req_bookmark_context_v1 ||
-                      resolveRequestBookmarkContext(reqUrl, reqBody, {
-                        method: reqMethod,
-                        url: reqUrl,
-                        body: reqBody,
-                        requestId: reqId,
-                      });
+                      (bookmarkRequest
+                        ? resolveRequestBookmarkContext(reqUrl, reqBody, {
+                            method: reqMethod,
+                            url: reqUrl,
+                            body: reqBody,
+                            requestId: reqId,
+                          })
+                        : null);
                     if (!xhr.__twe_req_bookmark_context_v1) {
                       xhr.__twe_req_bookmark_context_v1 = reqContext;
                     }
-                    setBookmarkContext(reqContext);
+                    if (bookmarkRequest && reqContext) {
+                      setBookmarkContext(reqContext);
+                    }
                     const normalizedReq = buildNormalizedHookMessageRequest({
                       method: reqMethod,
                       url: reqUrl,
@@ -2698,20 +3024,20 @@ export class ExtensionManager {
     // can block some managers' page injection modes.
     setTimeout(() => {
       try {
-        const hasUnsafe = !!unsafe;
-        const hasWrapped = !!pageWindow;
-        const hasExport = !!exportFunctionMaybe;
-        const openIsPatched = hookGlobalObject.XMLHttpRequest?.prototype?.open !== xhrOpen;
+        const capabilities = getRuntimeCapabilities();
+        const openIsPatched =
+          hookGlobalObject.XMLHttpRequest?.prototype?.open !==
+          (typeof originalOpen === 'function' ? originalOpen : undefined);
         if (!openIsPatched) {
           logger.error(
-            `XHR hook not active (unsafeWindow=${hasUnsafe}, wrappedJSObject=${hasWrapped}, exportFunction=${hasExport}). ` +
+            `XHR hook not active (unsafeWindow=${capabilities.hasUnsafeWindow}, wrappedJSObject=${capabilities.hasWrappedJSObject}, exportFunction=${capabilities.hasExportFunction}). ` +
               `Bookmark capture will not work.`,
           );
         } else if (this.debugEnabled) {
           logger.debug('XHR hook active', {
-            unsafeWindow: hasUnsafe,
-            wrappedJSObject: hasWrapped,
-            exportFunction: hasExport,
+            unsafeWindow: capabilities.hasUnsafeWindow,
+            wrappedJSObject: capabilities.hasWrappedJSObject,
+            exportFunction: capabilities.hasExportFunction,
           });
         }
       } catch (err) {
@@ -2721,7 +3047,12 @@ export class ExtensionManager {
   }
 
   private installFetchHooks(force = false) {
-    if (!fetchNative) {
+    if (!this.isHookModeEnabled('fetch')) {
+      return;
+    }
+
+    const fetchNative = (hookGlobalObject as Record<string, unknown>).fetch;
+    if (typeof fetchNative !== 'function') {
       logger.warn('Fetch API not found, skipping fetch hooks');
       return;
     }
@@ -2739,8 +3070,8 @@ export class ExtensionManager {
     );
     const fetchBase =
       typeof fetchBaseFromState === 'function'
-        ? (fetchBaseFromState as typeof window.fetch)
-        : fetchNative;
+        ? (fetchBaseFromState as typeof fetch)
+        : (fetchNative as typeof fetch);
 
     if (typeof fetchBase !== 'function') {
       logger.warn('Fetch API base function unavailable');
@@ -2754,71 +3085,111 @@ export class ExtensionManager {
       input: RequestInfo | URL,
       init?: RequestInit,
     ): Promise<Response> {
-      const method =
-        init?.method ??
-        (typeof Request !== 'undefined' && input instanceof Request ? input.method : 'GET');
-      const url =
-        typeof input === 'string'
-          ? input
-          : typeof URL !== 'undefined' && input instanceof URL
-            ? input.toString()
-            : typeof Request !== 'undefined' && input instanceof Request
-              ? input.url
-              : '';
-      const serializedBody = serializeRequestBodyText(init?.body);
-      const requestId = nextBookmarkRequestId();
-      const requestContext = resolveRequestBookmarkContext(url, serializedBody, {
-        method,
-        url,
-        body: serializedBody,
-        requestId,
-      });
-      setBookmarkContext(requestContext);
+      let method = 'GET';
+      let url = '';
+      let serializedBody: string | undefined;
+      let requestId = '';
+      let requestContext: BookmarkContextPayload | undefined;
 
-      const origFetch = pageAny[ORIG_FETCH_KEY];
+      try {
+        method =
+          init?.method ??
+          (typeof Request !== 'undefined' && input instanceof Request ? input.method : 'GET');
+      } catch {
+        method = init?.method ?? 'GET';
+      }
+
+      try {
+        url =
+          typeof input === 'string'
+            ? input
+            : typeof URL !== 'undefined' && input instanceof URL
+              ? input.toString()
+              : typeof Request !== 'undefined' && input instanceof Request
+                ? input.url
+                : '';
+      } catch {
+        url = '';
+      }
+
+      try {
+        serializedBody = serializeRequestBodyText(init?.body);
+      } catch {
+        serializedBody = undefined;
+      }
+
+      try {
+        requestId = nextBookmarkRequestId();
+      } catch {
+        requestId = '';
+      }
+
+      try {
+        if (isBookmarksApiRequest(url)) {
+          requestContext = resolveRequestBookmarkContext(url, serializedBody, {
+            method,
+            url,
+            body: serializedBody,
+            requestId,
+          });
+          setBookmarkContext(requestContext);
+        } else {
+          requestContext = undefined;
+        }
+      } catch (err) {
+        // Never let hook pre-processing break app fetches.
+        logger.debug('fetch request context capture failed', { method, url, err });
+      }
+
+      const origFetch = pageAny[ORIG_FETCH_KEY] ?? fetchBase;
       // Use call() to avoid illegal invocation issues.
       if (typeof origFetch !== 'function') {
         throw new Error('fetch base function unavailable');
       }
       const response = await (origFetch as typeof fetch).call(globalThis, input, init);
 
-      if (!url || !/\/graphql\/|\/api\/1\.1\//.test(url)) return response;
+      try {
+        if (!url || !/\/graphql\/|\/api\/1\.1\//.test(url)) return response;
 
-      const contentType = response.headers.get('content-type') ?? '';
-      const isTextualResponse =
-        !contentType || contentType.includes('json') || contentType.startsWith('text/');
+        const contentType = response.headers.get('content-type') ?? '';
+        const isTextualResponse =
+          !contentType || contentType.includes('json') || contentType.startsWith('text/');
 
-      if (!isTextualResponse) {
-        return response;
+        if (!isTextualResponse) {
+          return response;
+        }
+
+        // Read response body from a clone to avoid consuming the original stream.
+        void response
+          .clone()
+          .text()
+          .then((responseText: string) => {
+            if (!responseText) return;
+            try {
+              const normalizedReq = buildNormalizedHookMessageRequest({
+                method,
+                url,
+                body: serializedBody || '',
+                bookmarkContext: requestContext ?? null,
+                requestId,
+              });
+
+              postHookMessage({
+                __twe_mcp_hook_v1: true,
+                req: normalizedReq,
+                res: { status: response.status, responseText },
+              });
+            } catch {
+              // ignore
+            }
+          })
+          .catch((err: unknown) => {
+            logger.debug('fetch clone.text() failed', { method, url, err });
+          });
+      } catch (err) {
+        // Never throw after native fetch succeeds.
+        logger.debug('fetch response hook processing failed', { method, url, err });
       }
-
-      // Read response body from a clone to avoid consuming the original stream.
-      void response
-        .clone()
-        .text()
-        .then((responseText: string) => {
-          if (!responseText) return;
-          try {
-            const normalizedReq = buildNormalizedHookMessageRequest({
-              method,
-              url,
-              body: serializedBody || '',
-              bookmarkContext: requestContext ?? null,
-              requestId,
-            });
-
-            postHookMessage({
-              __twe_mcp_hook_v1: true,
-              req: normalizedReq,
-              res: { status: response.status, responseText },
-            });
-          } catch {
-            // ignore
-          }
-        })
-        .catch((err: unknown) => {
-          logger.debug('fetch clone.text() failed', { method, url, err });
-        });
 
       return response;
     };
@@ -2832,25 +3203,67 @@ export class ExtensionManager {
   }
 
   private startHookRepairLoop() {
+    if (this.runtimeModes.safeMode || this.runtimeModes.repairMode === 'off') {
+      return;
+    }
+
     if (this.hookRepairInterval !== null) {
       return;
     }
 
+    const schedule = (delayMs: number) => {
+      this.hookRepairInterval = setTimeout(() => {
+        this.hookRepairInterval = null;
+        repair();
+      }, delayMs);
+    };
+
     const repair = () => {
+      if (this.runtimeModes.safeMode || this.runtimeModes.repairMode === 'off') {
+        return;
+      }
+
       try {
         if (this.hookStats) {
           this.hookStats.repairCount += 1;
           this.syncRuntimeStats();
         }
-        this.installHttpHooks(true);
-        this.installFetchHooks(true);
-      } catch {
-        // ignore
+
+        if (this.isHookModeEnabled('xhr')) {
+          this.installHttpHooks(true);
+        }
+        if (this.isHookModeEnabled('fetch')) {
+          this.installFetchHooks(true);
+        }
+
+        const hookSelfTest = this.runHookSelfTest();
+        if (!hookSelfTest.ok) {
+          this.enableSafeMode('hook-repair-self-test-failed', hookSelfTest.error);
+          return;
+        }
+
+        this.hookRepairFailures = 0;
+        this.hookRepairBackoffMs = HOOK_REPAIR_INTERVAL_MS;
+      } catch (err) {
+        this.hookRepairFailures += 1;
+        this.hookRepairBackoffMs = Math.min(
+          this.hookRepairBackoffMs * 2,
+          HOOK_REPAIR_BACKOFF_MAX_MS,
+        );
+        logger.warn(
+          `Hook repair failed (${this.hookRepairFailures}/${HOOK_REPAIR_FAILURE_LIMIT})`,
+          err,
+        );
+        if (this.hookRepairFailures >= HOOK_REPAIR_FAILURE_LIMIT) {
+          this.enableSafeMode('hook-repair-failure-limit', err);
+          return;
+        }
       }
+
+      schedule(this.hookRepairBackoffMs);
     };
 
-    repair();
-    this.hookRepairInterval = setInterval(repair, HOOK_REPAIR_INTERVAL_MS);
+    schedule(0);
   }
 
   private runInterceptors(req: InterceptedRequest, res: XMLHttpRequest) {

@@ -5,6 +5,10 @@ import { extractDataFromResponse, extractTimelineTweet } from '@/utils/api';
 import logger from '@/utils/logger';
 
 const BOOKMARK_FOLDER_CACHE_STORAGE_KEY = 'twe_bookmark_folder_name_cache_v1';
+const BOOKMARK_FOLDER_BACKFILL_CANDIDATE_LIMIT = 260;
+const BOOKMARK_FOLDER_BACKFILL_SCAN_LIMIT = 1800;
+const pendingBookmarkFolderNameBackfills = new Set<string>();
+const inFlightBookmarkFolderNameBackfills = new Set<string>();
 
 function loadBookmarkFolderNameCache(): Map<string, string> {
   try {
@@ -38,6 +42,66 @@ function persistBookmarkFolderNameCache(cache: Map<string, string>): void {
   } catch {
     /* ignore */
   }
+}
+
+function extractTweetIdsForBackfill(tweets: Tweet[]): string[] {
+  const ids: string[] = [];
+  for (const tweet of tweets) {
+    if (!tweet || typeof tweet !== 'object') continue;
+    const restId = String((tweet as Tweet).rest_id || '').trim();
+    if (!restId) continue;
+    ids.push(restId);
+    if (ids.length >= BOOKMARK_FOLDER_BACKFILL_CANDIDATE_LIMIT) {
+      break;
+    }
+  }
+  return ids;
+}
+
+function queueFolderNameBackfill(folderIds: Iterable<string>): void {
+  for (const folderId of folderIds) {
+    const normalized = String(folderId || '').trim();
+    if (!normalized) continue;
+    pendingBookmarkFolderNameBackfills.add(normalized);
+  }
+}
+
+function triggerFolderNameBackfillIfNeeded(
+  extName: string,
+  folderId: string | null,
+  tweets: Tweet[],
+): void {
+  if (!folderId) return;
+  if (!pendingBookmarkFolderNameBackfills.has(folderId)) return;
+  if (inFlightBookmarkFolderNameBackfills.has(folderId)) return;
+
+  const folderName = bookmarkFolderNameCache.get(folderId);
+  if (!folderName) return;
+
+  const candidateTweetIds = extractTweetIdsForBackfill(tweets);
+  inFlightBookmarkFolderNameBackfills.add(folderId);
+  void db
+    .extBackfillRecentBookmarkFolderName(extName, folderId, folderName, {
+      candidateTweetIds,
+      candidateLimit: BOOKMARK_FOLDER_BACKFILL_CANDIDATE_LIMIT,
+      recentCaptureScanLimit: BOOKMARK_FOLDER_BACKFILL_SCAN_LIMIT,
+    })
+    .then((summary) => {
+      if ((summary?.inspected || 0) > 0) {
+        pendingBookmarkFolderNameBackfills.delete(folderId);
+      }
+      if ((summary?.updated || 0) > 0) {
+        logger.info(
+          `Bookmarks: folder-name backfill updated ${summary.updated} rows for folder ${folderId}`,
+        );
+      }
+    })
+    .catch(() => {
+      // keep pending state for retry on later requests
+    })
+    .finally(() => {
+      inFlightBookmarkFolderNameBackfills.delete(folderId);
+    });
 }
 
 /**
@@ -703,7 +767,8 @@ interface BookmarkFoldersSliceResponse {
   };
 }
 
-function parseBookmarkFoldersSlice(text: string): void {
+function parseBookmarkFoldersSlice(text: string): Set<string> {
+  const changedFolderIds = new Set<string>();
   try {
     const json = JSON.parse(text) as BookmarkFoldersSliceResponse;
     const items = json.data?.viewer?.user_results?.result?.bookmark_collections_slice?.items ?? [];
@@ -713,6 +778,7 @@ function parseBookmarkFoldersSlice(text: string): void {
         const old = bookmarkFolderNameCache.get(item.id);
         if (old !== item.name) {
           bookmarkFolderNameCache.set(item.id, item.name);
+          changedFolderIds.add(item.id);
           changed = true;
         }
       }
@@ -721,6 +787,7 @@ function parseBookmarkFoldersSlice(text: string): void {
   } catch {
     /* ignore */
   }
+  return changedFolderIds;
 }
 
 // https://twitter.com/i/api/graphql/.../BookmarkFoldersSlice - populates folder id->name cache
@@ -729,7 +796,12 @@ function parseBookmarkFoldersSlice(text: string): void {
 export const BookmarksInterceptor: Interceptor = (req, res, ext) => {
   if (/\/graphql\/.+\/BookmarkFoldersSlice/.test(req.url)) {
     const text = typeof res.responseText === 'string' ? res.responseText : '';
-    if (text) parseBookmarkFoldersSlice(text);
+    if (text) {
+      const changedFolderIds = parseBookmarkFoldersSlice(text);
+      if (changedFolderIds.size > 0) {
+        queueFolderNameBackfill(changedFolderIds);
+      }
+    }
     return;
   }
   if (
@@ -755,18 +827,35 @@ export const BookmarksInterceptor: Interceptor = (req, res, ext) => {
     const folderCtx = getBookmarkFolderContext({ ...req, responseText: res.responseText });
     const strictFolderId = resolveStrictBookmarkFolderId();
     if (strictFolderId) {
-      if (!explicitRequestFolderId) {
+      const strictMatchCandidate =
+        explicitRequestFolderId || pageFolderId || folderCtx.folder_id || null;
+      const strictMatchSource = explicitRequestFolderId
+        ? 'request'
+        : pageFolderId
+          ? 'page'
+          : folderCtx.folder_id
+            ? 'context'
+            : 'none';
+
+      if (!strictMatchCandidate) {
         incrementBookmarkDropCounter('bookmarkDropsStrictNoExplicitFolder');
-        logger.debug(`Bookmarks(strict): skip request without explicit folder id: ${req.url}`);
+        logger.debug(`Bookmarks(strict): skip request without folder evidence: ${req.url}`);
         return;
       }
-      if (explicitRequestFolderId !== strictFolderId) {
+      if (strictMatchCandidate !== strictFolderId) {
         incrementBookmarkDropCounter('bookmarkDropsStrictFolderMismatch');
         logger.debug(
-          `Bookmarks(strict): skip folder mismatch requestFolder=${explicitRequestFolderId}, strictFolder=${strictFolderId}`,
+          `Bookmarks(strict): skip folder mismatch source=${strictMatchSource} candidateFolder=${strictMatchCandidate}, strictFolder=${strictFolderId}`,
         );
         return;
       }
+
+      if (!explicitRequestFolderId && strictMatchSource !== 'none') {
+        logger.debug(
+          `Bookmarks(strict): allowing request without explicit folder id via ${strictMatchSource} context`,
+        );
+      }
+
       if (folderCtx.folder_id !== strictFolderId) {
         folderCtx.folder_id = strictFolderId;
         folderCtx.folder_url = `https://x.com/i/bookmarks/${strictFolderId}`;
@@ -804,6 +893,7 @@ export const BookmarksInterceptor: Interceptor = (req, res, ext) => {
 
     // Add captured data to the database.
     db.extAddTweets(ext.name, newData);
+    triggerFolderNameBackfillIfNeeded(ext.name, folderCtx.folder_id, newData);
 
     logger.info(
       `Bookmarks: ${newData.length} items received` +

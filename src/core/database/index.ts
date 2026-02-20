@@ -5,6 +5,26 @@ export * from './manager';
 /**
  * Global database manager singleton instance.
  */
-const databaseManager = new DatabaseManager();
+let databaseManager: DatabaseManager | null = null;
 
-export { databaseManager as db };
+export function getDatabaseManager(): DatabaseManager {
+  if (databaseManager) {
+    return databaseManager;
+  }
+  databaseManager = new DatabaseManager();
+  return databaseManager;
+}
+
+const dbProxy = new Proxy({} as DatabaseManager, {
+  get(_target, prop, receiver) {
+    const manager = getDatabaseManager();
+    const value = Reflect.get(manager, prop, receiver);
+    return typeof value === 'function' ? value.bind(manager) : value;
+  },
+  set(_target, prop, value, receiver) {
+    const manager = getDatabaseManager();
+    return Reflect.set(manager, prop, value, receiver);
+  },
+});
+
+export { dbProxy as db };

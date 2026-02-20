@@ -15,6 +15,9 @@ export interface AppOptions {
   filenamePattern?: string;
   language?: string;
   dedicatedDbForAccounts?: boolean;
+  safeMode?: boolean;
+  hookMode?: 'both' | 'xhr' | 'fetch' | 'off';
+  repairMode?: 'watchdog' | 'off';
   version?: string;
 }
 
@@ -35,6 +38,9 @@ export const DEFAULT_APP_OPTIONS: AppOptions = {
   filenamePattern: '{screen_name}_{id}_{type}_{num}_{date}.{ext}',
   language: '',
   dedicatedDbForAccounts: false,
+  safeMode: false,
+  hookMode: 'both',
+  repairMode: 'watchdog',
   version: packageJson.version,
 };
 

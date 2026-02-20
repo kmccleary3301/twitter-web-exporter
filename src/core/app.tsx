@@ -17,7 +17,7 @@ import { options } from './options';
 export function App() {
   const { t } = useTranslation();
 
-  const extensions = useSignal<Extension[]>([]);
+  const extensions = useSignal<Extension[]>(extensionManager.getExtensions());
   const currentTheme = useSignal(options.get('theme'));
   const showControlPanel = useSignal(options.get('showControlPanel'));
   const hookStats = useSignal<{
@@ -35,6 +35,12 @@ export function App() {
 
   // Update UI when extensions or options change.
   useEffect(() => {
+    // Initialize immediately in case extensions/options were already configured
+    // before this component subscribed.
+    extensions.value = extensionManager.getExtensions();
+    currentTheme.value = options.get('theme');
+    showControlPanel.value = options.get('showControlPanel');
+
     extensionManager.signal.subscribe(() => {
       extensions.value = extensionManager.getExtensions();
     });

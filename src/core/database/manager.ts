@@ -10,9 +10,14 @@ import { migration_20250609 } from '@/utils/migration';
 import logger from '@/utils/logger';
 import { ExtensionType } from '../extensions';
 import { options } from '../options';
+import { emitDatabaseMutation } from './mutation';
 
 const DB_NAME = packageJson.name;
 const DB_VERSION = 2;
+const CAPTURE_COUNT_SNAPSHOT_KEY = '__twe_capture_counts_v1';
+const CAPTURE_COUNT_SNAPSHOT_V2_KEY = '__twe_capture_counts_v2';
+const ACTIVE_DB_NAME_KEY = '__twe_active_db_name_v1';
+const CAPTURE_COUNT_EVENT_NAME = 'twe:capture-count-updated-v1';
 
 const BOOKMARK_CONTEXT_FIELDS = [
   '__bookmark_folder_id',
@@ -20,6 +25,18 @@ const BOOKMARK_CONTEXT_FIELDS = [
   '__bookmark_folder_name_source',
   '__bookmark_folder_url',
 ] as const;
+
+interface BookmarkFolderNameBackfillOptions {
+  candidateTweetIds?: string[];
+  candidateLimit?: number;
+  recentCaptureScanLimit?: number;
+}
+
+interface BookmarkFolderNameBackfillSummary {
+  candidates: number;
+  inspected: number;
+  updated: number;
+}
 
 function mergeTweetMetadata(existing: unknown, incoming: Tweet): Tweet {
   if (!existing || typeof existing !== 'object') {
@@ -68,12 +85,22 @@ export class DatabaseManager {
   private db: Dexie;
 
   constructor() {
-    const globalObject = unsafeWindow ?? window ?? globalThis;
-    const userId = globalObject.__META_DATA__?.userId ?? 'unknown';
+    let userId = 'unknown';
+    try {
+      const globalObject = (unsafeWindow ??
+        (typeof window !== 'undefined' ? window : undefined) ??
+        globalThis) as typeof globalThis & {
+        __META_DATA__?: { userId?: string };
+      };
+      userId = globalObject.__META_DATA__?.userId ?? 'unknown';
+    } catch {
+      userId = 'unknown';
+    }
     const suffix = options.get('dedicatedDbForAccounts') ? `_${userId}` : '';
     logger.debug(`Using database: ${DB_NAME}${suffix} for userId: ${userId}`);
 
     this.db = new Dexie(`${DB_NAME}${suffix}`);
+    this.publishActiveDatabaseName();
     this.init();
   }
 
@@ -144,6 +171,10 @@ export class DatabaseManager {
   */
 
   async extAddTweets(extName: string, tweets: Tweet[]) {
+    if (!tweets.length) {
+      return;
+    }
+
     await this.upsertTweets(tweets);
     await this.upsertCaptures(
       tweets.map((tweet) => ({
@@ -154,9 +185,19 @@ export class DatabaseManager {
         created_at: Date.now(),
       })),
     );
+
+    emitDatabaseMutation({
+      extension: extName,
+      operation: 'extAddTweets',
+    });
+    void this.publishCaptureCountSnapshot(extName);
   }
 
   async extAddUsers(extName: string, users: User[]) {
+    if (!users.length) {
+      return;
+    }
+
     await this.upsertUsers(users);
     await this.upsertCaptures(
       users.map((user) => ({
@@ -167,6 +208,12 @@ export class DatabaseManager {
         created_at: Date.now(),
       })),
     );
+
+    emitDatabaseMutation({
+      extension: extName,
+      operation: 'extAddUsers',
+    });
+    void this.publishCaptureCountSnapshot(extName);
   }
 
   /*
@@ -180,7 +227,119 @@ export class DatabaseManager {
     if (!captures) {
       return;
     }
-    return this.captures().bulkDelete(captures.map((capture) => capture.id));
+    const result = await this.captures().bulkDelete(captures.map((capture) => capture.id));
+    emitDatabaseMutation({
+      extension: extName,
+      operation: 'extClearCaptures',
+    });
+    void this.publishCaptureCountSnapshot(extName);
+    return result;
+  }
+
+  async extBackfillRecentBookmarkFolderName(
+    extName: string,
+    folderId: string,
+    folderName: string,
+    options: BookmarkFolderNameBackfillOptions = {},
+  ): Promise<BookmarkFolderNameBackfillSummary> {
+    if (!extName || !folderId || !folderName) {
+      return { candidates: 0, inspected: 0, updated: 0 };
+    }
+
+    const candidateLimit = Math.max(1, Math.min(1000, Number(options.candidateLimit) || 250));
+    const recentCaptureScanLimit = Math.max(
+      100,
+      Math.min(5000, Number(options.recentCaptureScanLimit) || 1800),
+    );
+
+    const candidateIds = new Set<string>();
+    for (const id of options.candidateTweetIds || []) {
+      if (typeof id !== 'string') continue;
+      const normalized = id.trim();
+      if (!normalized) continue;
+      candidateIds.add(normalized);
+      if (candidateIds.size >= candidateLimit) break;
+    }
+
+    if (candidateIds.size < candidateLimit) {
+      const recent = await this.captures()
+        .orderBy('created_at')
+        .reverse()
+        .limit(recentCaptureScanLimit)
+        .toArray()
+        .catch(this.logError);
+
+      for (const row of recent || []) {
+        if (row?.extension !== extName || row?.type !== ExtensionType.TWEET) {
+          continue;
+        }
+
+        const normalized = String(row?.data_key || '').trim();
+        if (!normalized || candidateIds.has(normalized)) {
+          continue;
+        }
+
+        candidateIds.add(normalized);
+        if (candidateIds.size >= candidateLimit) {
+          break;
+        }
+      }
+    }
+
+    if (!candidateIds.size) {
+      return { candidates: 0, inspected: 0, updated: 0 };
+    }
+
+    const candidateArray = [...candidateIds];
+
+    return await this.db
+      .transaction('rw', this.tweets(), async () => {
+        const rows = await this.tweets().where('rest_id').anyOf(candidateArray).toArray();
+
+        const updates: Tweet[] = [];
+        for (const row of rows) {
+          const current = row as unknown as Record<string, unknown>;
+          if (String(current.__bookmark_folder_id || '') !== folderId) {
+            continue;
+          }
+
+          const currentName = String(current.__bookmark_folder_name || '');
+          const currentSource = String(current.__bookmark_folder_name_source || '');
+          if (currentName === folderName && currentSource === 'api') {
+            continue;
+          }
+
+          updates.push({
+            ...row,
+            ...({
+              __bookmark_folder_name: folderName,
+              __bookmark_folder_name_source: 'api',
+            } as unknown as Partial<Tweet>),
+          } as Tweet);
+        }
+
+        if (updates.length) {
+          await this.tweets().bulkPut(updates);
+          emitDatabaseMutation({
+            extension: extName,
+            operation: 'bookmarkFolderNameBackfill',
+          });
+        }
+
+        return {
+          candidates: candidateArray.length,
+          inspected: rows.length,
+          updated: updates.length,
+        };
+      })
+      .catch((error) => {
+        this.logError(error);
+        return {
+          candidates: candidateArray.length,
+          inspected: 0,
+          updated: 0,
+        };
+      });
   }
 
   /*
@@ -194,13 +353,22 @@ export class DatabaseManager {
   }
 
   async import(data: Blob) {
-    return importInto(this.db, data).catch(this.logError);
+    const result = await importInto(this.db, data).catch(this.logError);
+    emitDatabaseMutation({
+      operation: 'import',
+    });
+    this.publishCaptureCountSnapshotForAllKnownExtensions();
+    return result;
   }
 
   async clear() {
     await this.deleteAllCaptures();
     await this.deleteAllTweets();
     await this.deleteAllUsers();
+    emitDatabaseMutation({
+      operation: 'clear',
+    });
+    this.publishCaptureCountSnapshotForAllKnownExtensions();
     logger.info('Database cleared');
   }
 
@@ -214,6 +382,101 @@ export class DatabaseManager {
     } catch (error) {
       this.logError(error);
       return null;
+    }
+  }
+
+  private async publishCaptureCountSnapshot(extName: string): Promise<void> {
+    try {
+      const count = Number((await this.extGetCaptureCount(extName)) || 0);
+      const dbName = this.db.name;
+      const updatedAt = Date.now();
+      const globalObject = globalThis as Record<string, unknown>;
+      const current = globalObject[CAPTURE_COUNT_SNAPSHOT_KEY];
+      const map =
+        current && typeof current === 'object'
+          ? ({ ...(current as Record<string, number>) } as Record<string, number>)
+          : ({} as Record<string, number>);
+      map[extName] = count;
+
+      const currentV2 = globalObject[CAPTURE_COUNT_SNAPSHOT_V2_KEY];
+      const mapV2 =
+        currentV2 && typeof currentV2 === 'object'
+          ? ({ ...(currentV2 as Record<string, unknown>) } as Record<string, unknown>)
+          : ({} as Record<string, unknown>);
+      mapV2[extName] = { count, dbName, updatedAt };
+
+      globalObject[CAPTURE_COUNT_SNAPSHOT_KEY] = map;
+      globalObject[CAPTURE_COUNT_SNAPSHOT_V2_KEY] = mapV2;
+      if (typeof window !== 'undefined') {
+        (window as unknown as Record<string, unknown>)[CAPTURE_COUNT_SNAPSHOT_KEY] = map;
+        (window as unknown as Record<string, unknown>)[CAPTURE_COUNT_SNAPSHOT_V2_KEY] = mapV2;
+      }
+
+      try {
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem(CAPTURE_COUNT_SNAPSHOT_KEY, JSON.stringify(map));
+          localStorage.setItem(CAPTURE_COUNT_SNAPSHOT_V2_KEY, JSON.stringify(mapV2));
+        }
+      } catch {
+        // ignore localStorage failures
+      }
+
+      try {
+        if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+          const detail = {
+            extension: extName,
+            count,
+            dbName,
+            updatedAt,
+          };
+          try {
+            window.dispatchEvent(
+              new CustomEvent(CAPTURE_COUNT_EVENT_NAME, {
+                detail,
+              }),
+            );
+          } catch {
+            window.dispatchEvent(new Event(CAPTURE_COUNT_EVENT_NAME));
+          }
+        }
+      } catch {
+        // ignore event dispatch failures
+      }
+    } catch {
+      // ignore snapshot failures
+    }
+  }
+
+  private publishCaptureCountSnapshotForAllKnownExtensions(): void {
+    void this.captures()
+      .toArray()
+      .then((rows) => {
+        const set = new Set<string>();
+        for (const row of rows) {
+          if (row?.extension) {
+            set.add(String(row.extension));
+          }
+        }
+        return Promise.all([...set].map((extName) => this.publishCaptureCountSnapshot(extName)));
+      })
+      .catch(() => {
+        // ignore
+      });
+  }
+
+  private publishActiveDatabaseName(): void {
+    try {
+      const dbName = this.db.name;
+      const globalObject = globalThis as Record<string, unknown>;
+      globalObject[ACTIVE_DB_NAME_KEY] = dbName;
+      if (typeof window !== 'undefined') {
+        (window as unknown as Record<string, unknown>)[ACTIVE_DB_NAME_KEY] = dbName;
+      }
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(ACTIVE_DB_NAME_KEY, dbName);
+      }
+    } catch {
+      // ignore
     }
   }
 
